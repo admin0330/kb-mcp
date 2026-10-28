@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kb-mcp"
-version = "0.1.0"
+version = "0.3.0"
 description = "A mount-tolerant, portable MCP server for external APFS knowledge base (hybrid retrieval + AI organize)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,6 +39,7 @@ semantic = [
 [project.scripts]
 kb-mcp = "kb_mcp.kb_mcp_server:main"
 kb-mcp-server = "kb_mcp.kb_mcp_server:main"
+kb-files-gateway = "kb_mcp.fs_gateway:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kb_mcp"]

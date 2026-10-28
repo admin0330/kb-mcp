@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-ROOT="/Users/ym1r/kb-mcp"
+ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="${ROOT}/server"
 VENV="${SERVER_DIR}/.venv"
 LOG="${ROOT}/setup.log"
@@ -63,6 +63,18 @@ print("  core deps:", "OK" if not missing else f"MISSING {missing}")
 print("  semantic :", sem)
 sys.exit(1 if missing else 0)
 PY
+
+# --- 5. pinned local copy of the official filesystem server ---------------- #
+# kb-files then starts in ~0.3s and works offline (npx checks the registry).
+FS_VERSION="${KB_FS_VERSION:-2.0.1}"
+if command -v npm >/dev/null 2>&1; then
+  echo ">> installing @modelcontextprotocol/server-filesystem@${FS_VERSION} into server/node"
+  npm install --prefix "${SERVER_DIR}/node" --no-audit --no-fund --silent \
+    "@modelcontextprotocol/server-filesystem@${FS_VERSION}" \
+    || echo "   (npm install failed; kb-files will fall back to npx)"
+else
+  echo ">> npm not found; kb-files will fall back to npx at runtime"
+fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] setup complete."
 echo "Next: copy config/claude_desktop_config.json into"
