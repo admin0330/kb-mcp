@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "kb-retrieval": {
+      "command": "/Users/ym1r/kb-mcp/scripts/mcp-launch-retrieval.sh"
+    },
+    "kb-files": {
+      "command": "/Users/ym1r/kb-mcp/scripts/mcp-launch-fs.sh"
+    }
+  }
+}
