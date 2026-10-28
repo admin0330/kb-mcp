@@ -72,7 +72,7 @@ except ImportError:
                          TRASH_DIRNAME, file_sha256)
     from extractors import ExtractionError, extract_text, is_supported  # type: ignore  # noqa: E402
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 VOLUME = Path(os.environ.get("KB_VOLUME", "/Volumes/KnowledgeBase/Database"))
 ENABLE_SEMANTIC = os.environ.get("KB_ENABLE_SEMANTIC", "0") == "1"
@@ -1102,10 +1102,43 @@ def _sync_index_rename(old_rel: str, new_rel: str) -> bool:
         return False
 
 
+def _move_dir(src: Path, dest_dir: Path, new_name: str) -> dict:
+    """Move a whole folder (e.g. restoring one from _Trash) and keep the index in step."""
+    root = VOLUME.resolve()
+    if src == root or _top_dir(src) in {META_DIRNAME, "mcp"} or \
+            (src.parent == root and src.name in CATEGORY_DIRS + [TRASH_DIRNAME]):
+        raise ValueError(f"{_rel(src) or '/'} is a top-level or system folder")
+    if dest_dir == src or src in dest_dir.parents:
+        raise ValueError("cannot move a folder into itself")
+    name = _clean_name(new_name) if (new_name or "").strip() else src.name
+    old_rel = _rel(src)
+    if (dest_dir / name).resolve() == src:
+        return {"from": old_rel, "to": old_rel, "unchanged": True}
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = _unique_target(dest_dir, name)
+    shutil.move(str(src), str(target))
+    new_rel = _rel(target)
+    try:
+        _indexer.rename_prefix_in_index(old_rel, new_rel)
+    except Exception as exc:  # noqa: BLE001 - reconciled below / by reindex
+        _stderr(f"index prefix rename {old_rel} -> {new_rel} failed: {exc}")
+    files = [p for p in target.rglob("*")
+             if p.is_file() and not any(part.startswith(".") for part in p.relative_to(target).parts)]
+    indexed = set(_indexer.indexed_paths())
+    _log(f"move {old_rel}/ -> {new_rel}/ ({len(files)} files)")
+    out = {"from": old_rel, "to": new_rel, "files": len(files)}
+    missing = [_rel(p) for p in files if is_supported(p) and _rel(p) not in indexed]
+    if missing:
+        out["_index_many"] = missing
+    return out
+
+
 def _move_one(src_rel: str, dest_dir_rel: str, new_name: str = "") -> dict:
-    """Move/rename one file and keep the index in step. Raises on bad input."""
+    """Move/rename one file or folder and keep the index in step."""
     src = _safe(src_rel)
     dest_dir = _user_dir(dest_dir_rel)
+    if src.is_dir():
+        return _move_dir(src, dest_dir, new_name)
     if not src.is_file():
         raise FileNotFoundError(f"not found: {src_rel}")
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1129,6 +1162,8 @@ def _move_one(src_rel: str, dest_dir_rel: str, new_name: str = "") -> dict:
 
 def _finish_moves(results: List[dict]) -> dict:
     to_index = [r.pop("_index") for r in results if "_index" in r]
+    for r in results:
+        to_index.extend(r.pop("_index_many", []))
     if any(not r.get("unchanged") for r in results if r.get("to")):
         _refresher.schedule()
     return _index_now(to_index) if to_index else {}
@@ -1136,11 +1171,12 @@ def _finish_moves(results: List[dict]) -> dict:
 
 @kb_tool(write=True)
 def kb_move_file(src_rel: str, dest_dir_rel: str, new_name: str = "") -> str:
-    """Move (and optionally rename) one file. For several files use kb_organize.
+    """Move (and optionally rename) one file or folder. For many, use kb_organize.
 
-    The search index is kept in sync and INDEX.md refreshes automatically.
+    Also restores items from _Trash. The search index is kept in sync and
+    INDEX.md refreshes automatically.
 
-    :param src_rel: Current path, e.g. ``_Inbox/report.pdf``.
+    :param src_rel: Current path, e.g. ``_Inbox/report.pdf`` or a folder.
     :param dest_dir_rel: Target directory, e.g. ``01_Documents``.
     :param new_name: Optional new filename; the extension is kept if omitted.
     """

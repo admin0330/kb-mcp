@@ -143,6 +143,7 @@ class SearchAndDedupTests(unittest.TestCase):
         self.vol = Path(tempfile.mkdtemp(prefix="kbs-"))
         (self.vol / "01_Documents").mkdir()
         (self.vol / "03_Notes").mkdir()
+        (self.vol / "04_Archive").mkdir()
         (self.vol / "01_Documents" / "2026-10-25_财务预算_硬件采购清单.txt").write_text(
             "第三季度采购：服务器、显示器、键盘。总预算十二万。", encoding="utf-8")
         (self.vol / "03_Notes" / "猫粮笔记.md").write_text(
@@ -203,6 +204,27 @@ class SearchAndDedupTests(unittest.TestCase):
         self.idx.reindex()
         self.assertNotIn("INDEX.md", self.idx.indexed_paths())
         self.assertIn("03_Notes/INDEX.md", self.idx.indexed_paths())
+
+    def test_snippet_skips_front_matter(self) -> None:
+        note = self.vol / "03_Notes" / "带头部.md"
+        note.write_text('---\ntitle: "带头部"\ntags: ["猫"]\ncontent_sha256: abcdef0123456789\n---\n\n'
+                        "正文第一句。这里写着钛合金猫爬架。", encoding="utf-8")
+        self.idx.index_paths(["03_Notes/带头部.md"])
+        for q in ("钛合金", "带头部"):           # body match / file-name (header-only) match
+            snip = self.idx.search(q, mode="keyword")[0].snippet
+            self.assertNotIn("content_sha256", snip, q)
+            self.assertTrue(snip.startswith("正文第一句"), snip)
+        plain = Indexer._snippet("---\n普通分隔线\n---\n正文", ["正文"])
+        self.assertIn("普通分隔线", plain)        # not front matter: left alone
+
+    def test_rename_prefix_in_index(self) -> None:
+        moved = self.vol / "04_Archive" / "Notes_old"
+        shutil.move(str(self.vol / "03_Notes"), str(moved))
+        n = self.idx.rename_prefix_in_index("03_Notes", "04_Archive/Notes_old")
+        self.assertEqual(n, 2)
+        self.assertIn("04_Archive/Notes_old/猫粮笔记.md", self.idx.indexed_paths())
+        self.assertEqual(self.paths("猫粮品牌")[0].split("/")[0], "04_Archive")
+        self.assertEqual(self.idx.rename_prefix_in_index("01_Documents_x", "y"), 0)  # "_" escaped
 
     def test_trash_is_not_indexed(self) -> None:
         (self.vol / "_Trash").mkdir()

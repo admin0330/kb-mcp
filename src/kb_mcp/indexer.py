@@ -479,6 +479,23 @@ class Indexer:
         except NoIndexYet:
             return
 
+    def rename_prefix_in_index(self, old_dir: str, new_dir: str) -> int:
+        """Re-point every indexed path under ``old_dir/`` to ``new_dir/``."""
+        old_dir, new_dir = old_dir.strip("/"), new_dir.strip("/")
+        esc = old_dir.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        try:
+            with self._db(create=False) as conn:
+                n = conn.execute("SELECT COUNT(*) AS n FROM files WHERE path LIKE ? ESCAPE '\\'",
+                                 (esc + "/%",)).fetchone()["n"]
+                for table in ("chunks", "embeddings", "files"):
+                    conn.execute(
+                        f"UPDATE {table} SET path = ? || substr(path, ?) "
+                        f"WHERE path LIKE ? ESCAPE '\\'",
+                        (new_dir, len(old_dir) + 1, esc + "/%"))
+                return n
+        except NoIndexYet:
+            return 0
+
     def index_paths(self, rels: Sequence[str], force: bool = False,
                     max_file_mb: int = 50) -> IndexStats:
         """Index (or drop) specific files right away -- no full drive walk.
@@ -771,19 +788,38 @@ class Indexer:
             out.append(SearchHit(path, cid, hit.snippet, round(score, 5), "hybrid"))
         return out
 
-    @staticmethod
-    def _snippet(content: str, terms, width: int = 280) -> str:
+    _FRONT_KEY = re.compile(r"^[A-Za-z_][\w-]*:")
+
+    @classmethod
+    def _body_start(cls, content: str) -> int:
+        """Offset after a leading YAML front-matter block (kb_add_note headers)."""
+        if not content.startswith("---\n"):
+            return 0
+        end = content.find("\n---\n", 3)
+        if end == -1:
+            return 0
+        lines = [ln for ln in content[4:end].splitlines() if ln.strip()]
+        if not lines or len(lines) > 30 or not all(cls._FRONT_KEY.match(ln) for ln in lines):
+            return 0
+        body = end + 5
+        while body < len(content) and content[body] == "\n":
+            body += 1
+        return body
+
+    @classmethod
+    def _snippet(cls, content: str, terms, width: int = 280) -> str:
         if not content:
             return ""
         if isinstance(terms, str):
             terms = terms.split()
+        body = cls._body_start(content)
         lower = content.lower()
-        positions = [p for p in (lower.find(t.lower()) for t in terms) if p >= 0]
-        pos = min(positions) if positions else -1
-        if pos < 0:
-            return content[:width].strip()
-        start = max(0, pos - width // 3)
-        return ("…" if start else "") + content[start:start + width].strip() + "…"
+        positions = [p for p in (lower.find(t.lower(), body) for t in terms) if p >= 0]
+        if not positions:  # matched only the header (title/tags) or not at all
+            text = content[body:body + width].strip()
+            return text + ("…" if len(content) > body + width else "")
+        start = max(body, min(positions) - width // 3)
+        return ("…" if start > body else "") + content[start:start + width].strip() + "…"
 
     # ---- stats ---------------------------------------------------------- #
     def stats(self) -> dict:

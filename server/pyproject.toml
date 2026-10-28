@@ -1,6 +1,6 @@
 [project]
 name = "kb-mcp-server"
-version = "0.3.0"
+version = "0.3.1"
 description = "Mount-tolerant MCP server for an external APFS knowledge base (retrieval + index-aware file ops)"
 requires-python = ">=3.10"
 dependencies = [
