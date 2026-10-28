@@ -5,11 +5,11 @@
 # <volume>/.mcp_meta/init.log as well as stdout.
 #
 # Usage:
-#   ./init_drive.sh [/Volumes/KnowledgeBase]
+#   ./init_drive.sh [/Volumes/KnowledgeBase/Database]   (the knowledge-base root)
 #
 set -euo pipefail
 
-VOLUME="${1:-/Volumes/KnowledgeBase}"
+VOLUME="${1:-/Volumes/KnowledgeBase/Database}"
 META_DIR="${VOLUME}/.mcp_meta"
 INDEX_FILE="${VOLUME}/INDEX.md"
 LOG_FILE="${META_DIR}/init.log"

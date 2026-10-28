@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-ROOT="/Users/ym1r/kb-mcp"
+ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="${ROOT}/server"
 VENV="${SERVER_DIR}/.venv"
 LOG="${ROOT}/setup.log"
