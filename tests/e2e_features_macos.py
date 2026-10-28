@@ -104,6 +104,8 @@ def main() -> int:
               note.startswith(f"03_Notes/{TODAY}_会议纪要 2026_10_ 硬盘") and note.endswith(".md"),
               note)
         check("add_note is searchable immediately", note in paths(c, "猫粮预算"))
+        snip = c.tool("kb_search", {"query": "猫粮预算"})[0]["results"][0]["snippet"]
+        check("snippet hides the YAML header", "content_sha256" not in snip and snip.startswith("讨论了"), snip[:40])
         text = (KB / note).read_text(encoding="utf-8")
         check("add_note header", text.startswith("---\ntitle: ") and 'source: "微信"' in text)
         s, _, _ = c.tool("kb_add_note", {"title": "另一个标题", "content": "讨论了硬盘采购和猫粮预算。\n"})
@@ -170,6 +172,21 @@ def main() -> int:
         check("restore from trash is searchable again", "01_Documents/seed_2.md" in paths(c, "新加坡"))
         s, _, _ = c.tool("kb_trash", {"relpath": "01_Documents"})
         check("trash refuses category folders", s.get("error") == "protected")
+        (KB / "02_Books" / "系列").mkdir()
+        (KB / "02_Books" / "系列" / "第一册.md").write_text("龙与地下城入门手册", encoding="utf-8")
+        c.tool("kb_health_check", {"fix": True})
+        s, _, _ = c.tool("kb_trash", {"relpath": "02_Books/系列"})
+        check("trash a folder", s.get("removed_from_index") == 1 and not paths(c, "龙与地下城"))
+        hint = s.get("restore", {})
+        s, _, _ = c.tool("kb_move_file", {"src_rel": hint.get("src_rel", ""),
+                                          "dest_dir_rel": hint.get("dest_dir_rel", "")})
+        check("restore a folder with the returned hint", s.get("to") == "02_Books/系列"
+              and "02_Books/系列/第一册.md" in paths(c, "龙与地下城"), str(s.get("to") or s))
+        s, _, _ = c.tool("kb_move_file", {"src_rel": "02_Books/系列", "dest_dir_rel": "04_Archive",
+                                          "new_name": "旧系列"})
+        check("move a folder keeps it searchable", "04_Archive/旧系列/第一册.md" in paths(c, "龙与地下城"))
+        s, _, _ = c.tool("kb_move_file", {"src_rel": "01_Documents", "dest_dir_rel": "04_Archive"})
+        check("category folders cannot be moved", s.get("ok") is False)
 
         # --- duplicates ---------------------------------------------------------- #
         c.tool("kb_add_note", {"title": "副本", "content": "讨论了硬盘采购和猫粮预算。",

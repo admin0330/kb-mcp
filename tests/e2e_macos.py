@@ -32,6 +32,7 @@ DMG = WORK / "kbtest.sparseimage"
 LOGS = WORK / "logs"
 LOGS.mkdir()
 FS_CMD = ["npx", "-y", "@modelcontextprotocol/server-filesystem", str(KB)]
+OLD_REF = "032f29d"  # v0.1.0, the release before the status hardening (comparison baseline)
 
 results: list = []
 observations: list = []
@@ -107,7 +108,7 @@ def old_code_dir() -> Path:
     d = WORK / "old_server"
     d.mkdir()
     for f in ("kb_mcp_server.py", "indexer.py", "extractors.py", "placeholder_server.py"):
-        r = sh("git", "-C", str(REPO), "show", f"HEAD:server/{f}")
+        r = sh("git", "-C", str(REPO), "show", f"{OLD_REF}:server/{f}")
         (d / f).write_text(r.stdout)
     return d
 
