@@ -77,6 +77,7 @@ def detach() -> None:
 def env(**extra: str) -> dict:
     e = dict(os.environ)
     e.update({"KB_VOLUME": str(KB), "KB_ENABLE_SEMANTIC": "0", "PYTHONFAULTHANDLER": "1",
+              "KB_AUTO_REINDEX": "0",  # these tests drive reindex by hand
               "PATH": "/opt/homebrew/bin:/usr/local/bin:" + e.get("PATH", "")})
     e.update(extra)
     return e

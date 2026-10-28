@@ -138,5 +138,91 @@ class IndexerTests(unittest.TestCase):
         self.assertEqual(result["stats"]["files_indexed"], 60)  # WAL: sees committed data
 
 
+class SearchAndDedupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.vol = Path(tempfile.mkdtemp(prefix="kbs-"))
+        (self.vol / "01_Documents").mkdir()
+        (self.vol / "03_Notes").mkdir()
+        (self.vol / "01_Documents" / "2026-10-25_财务预算_硬件采购清单.txt").write_text(
+            "第三季度采购：服务器、显示器、键盘。总预算十二万。", encoding="utf-8")
+        (self.vol / "03_Notes" / "猫粮笔记.md").write_text(
+            "小橘喜欢的猫粮品牌和硬件无关，预算每月两百。", encoding="utf-8")
+        (self.vol / "03_Notes" / "copy.md").write_text(
+            "小橘喜欢的猫粮品牌和硬件无关，预算每月两百。", encoding="utf-8")
+        self.idx = Indexer(self.vol)
+        self.idx.reindex()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.vol, ignore_errors=True)
+
+    def paths(self, query: str, **kw) -> list:
+        return [h.path for h in self.idx.search(query, mode="keyword", **kw)]
+
+    def test_multi_word_query_matches_all_words(self) -> None:
+        got = self.paths("服务器 显示器")
+        self.assertEqual(got[0], "01_Documents/2026-10-25_财务预算_硬件采购清单.txt")
+
+    def test_short_words_and_any_word_fallback(self) -> None:
+        self.assertTrue(self.paths("预算"))                       # 2-char word
+        got = self.idx.search("显示器 不存在的词", mode="keyword")  # nothing has both
+        self.assertTrue(got)
+        self.assertEqual(got[0].source, "keyword-partial")
+
+    def test_filename_match(self) -> None:
+        hits = self.idx.search("采购清单", mode="keyword")
+        self.assertEqual(hits[0].source, "filename")
+        self.assertFalse([h for h in self.idx.search("Documents", mode="keyword")
+                          if h.source == "filename"])   # folder names don't count
+
+    def test_folder_filter(self) -> None:
+        self.assertTrue(all(p.startswith("03_Notes/") for p in self.paths("预算", folder="03_Notes")))
+        self.assertTrue(all(p.startswith("01_Documents/")
+                            for p in self.paths("预算", folder="01_Documents/")))
+
+    def test_duplicates_and_hash_lookup(self) -> None:
+        d = self.idx.find_duplicates()
+        self.assertEqual(len(d["groups"]), 1)
+        self.assertEqual(sorted(d["groups"][0]["paths"]), ["03_Notes/copy.md", "03_Notes/猫粮笔记.md"])
+        from indexer import file_sha256
+        sha = file_sha256(self.vol / "03_Notes" / "copy.md")
+        self.assertEqual(len(self.idx.find_by_hash(sha)), 2)
+
+    def test_index_paths_is_immediate_and_handles_removal(self) -> None:
+        new = self.vol / "03_Notes" / "新笔记.md"
+        new.write_text("量子纠缠的猫", encoding="utf-8")
+        st = self.idx.index_paths(["03_Notes/新笔记.md"])
+        self.assertEqual(st.indexed, 1)
+        self.assertEqual(self.paths("量子纠缠")[0], "03_Notes/新笔记.md")
+        new.unlink()
+        self.assertEqual(self.idx.index_paths(["03_Notes/新笔记.md"]).removed, 1)
+        self.assertFalse(self.paths("量子纠缠"))
+
+    def test_root_index_md_is_not_indexed(self) -> None:
+        (self.vol / "INDEX.md").write_text("- 2026-10-25_财务预算_硬件采购清单.txt", encoding="utf-8")
+        (self.vol / "03_Notes" / "INDEX.md").write_text("子目录里的同名文件照常索引", encoding="utf-8")
+        self.idx.reindex()
+        self.assertNotIn("INDEX.md", self.idx.indexed_paths())
+        self.assertIn("03_Notes/INDEX.md", self.idx.indexed_paths())
+
+    def test_trash_is_not_indexed(self) -> None:
+        (self.vol / "_Trash").mkdir()
+        (self.vol / "_Trash" / "old.md").write_text("回收站里的内容", encoding="utf-8")
+        self.idx.reindex()
+        self.assertFalse(self.paths("回收站里的内容"))
+
+    def test_old_schema_is_migrated_and_backfilled(self) -> None:
+        conn = sqlite3.connect(str(self.idx.db_path))
+        conn.execute("CREATE TABLE f2 AS SELECT path, mtime, size, n_chunks, indexed_at FROM files")
+        conn.execute("DROP TABLE files")
+        conn.execute("ALTER TABLE f2 RENAME TO files")
+        conn.commit()
+        conn.close()
+        fresh = Indexer(self.vol)
+        st = fresh.reindex()
+        self.assertEqual(st.hashed, 3)
+        self.assertEqual(fresh.find_duplicates()["unhashed"], 0)
+        self.assertEqual(len(fresh.find_duplicates()["groups"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

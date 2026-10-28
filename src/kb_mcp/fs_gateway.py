@@ -44,7 +44,7 @@ try:
 except ImportError:
     import health  # type: ignore  # noqa: E402
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 VOLUME = Path(os.environ.get("KB_VOLUME", "/Volumes/KnowledgeBase/Database"))
 CACHE_DIR = Path(os.environ.get("KB_CACHE_DIR", str(Path.home() / ".cache" / "kb-mcp")))

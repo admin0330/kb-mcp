@@ -2,7 +2,8 @@
 
 Storage lives in a single SQLite database at ``<volume>/.mcp_meta/index.db``:
 
-* ``files``       - one row per indexed file (mtime/size for change detection).
+* ``files``       - one row per indexed file (mtime/size for change detection,
+                    sha256 of the bytes for duplicate detection).
 * ``chunks``      - FTS5 virtual table (``trigram`` tokenizer so Chinese
                     substring search works) holding the chunked text.
 * ``embeddings``  - optional per-chunk float32 vectors for semantic search.
@@ -25,6 +26,7 @@ Removable-drive rules (learned the hard way):
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sqlite3
@@ -34,7 +36,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 try:
@@ -49,13 +51,26 @@ DB_FILENAME = "index.db"
 BUSY_TIMEOUT_S = 10.0      # how long a writer waits for another writer
 READ_TIMEOUT_S = 2.0       # status/stat reads must answer quickly
 JOURNAL_MODE = os.environ.get("KB_SQLITE_JOURNAL", "DELETE").upper()
+TRASH_DIRNAME = "_Trash"
+MAX_TERMS = 8
+# Generated files at the drive root that must not pollute search results.
+SKIP_ROOT_FILES = {"INDEX.md"}
 
 # Directories we never index (metadata, macOS/Spotlight cruft, VCS, tooling).
 SKIP_DIRS = {
     META_DIRNAME, ".git", ".svn", "node_modules", "__pycache__", "mcp",
     ".Trashes", ".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100",
-    ".TemporaryItems",
+    ".TemporaryItems", TRASH_DIRNAME,
 }
+
+
+def file_sha256(path: Path, block: int = 1 << 20) -> str:
+    """Hex SHA-256 of a file's bytes (streamed, constant memory)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(block), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class NoIndexYet(RuntimeError):
@@ -82,6 +97,7 @@ class IndexStats:
     skipped_unchanged: int = 0
     removed: int = 0
     failed: int = 0
+    hashed: int = 0                         # unchanged files that only got a hash
     errors: List[str] = field(default_factory=list)
     seconds: float = 0.0
     walk_errors: List[str] = field(default_factory=list)
@@ -274,6 +290,11 @@ class Indexer:
                    PRIMARY KEY (path, cid)
                )"""
         )
+        # v0.3 migration: content hash for duplicate detection.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+        if "sha256" not in cols:
+            conn.execute("ALTER TABLE files ADD COLUMN sha256 TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_files_sha ON files(sha256)")
         conn.commit()
 
     # ---- embedding helpers --------------------------------------------- #
@@ -317,8 +338,9 @@ class Indexer:
 
         for root, dirs, names in os.walk(self.volume, onerror=onerror):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            at_root = Path(root) == self.volume
             for name in names:
-                if name.startswith("."):
+                if name.startswith(".") or (at_root and name in SKIP_ROOT_FILES):
                     continue
                 p = Path(root) / name
                 if is_supported(p):
@@ -346,8 +368,8 @@ class Indexer:
         started = time.time()
         stats = IndexStats()
         with self._db(create=True) as conn:
-            known = {row["path"]: (row["mtime"], row["size"]) for row in
-                     conn.execute("SELECT path, mtime, size FROM files")}
+            known = {row["path"]: (row["mtime"], row["size"], row["sha256"]) for row in
+                     conn.execute("SELECT path, mtime, size, sha256 FROM files")}
             seen: set[str] = set()
             dirty = 0
             last_commit = time.monotonic()
@@ -373,6 +395,14 @@ class Indexer:
                 prev = known.get(rel)
                 if not full and prev and abs(prev[0] - st.st_mtime) < 1 and prev[1] == st.st_size:
                     stats.skipped_unchanged += 1
+                    if not prev[2]:  # indexed by an older version: add the hash
+                        try:
+                            conn.execute("UPDATE files SET sha256 = ? WHERE path = ?",
+                                         (file_sha256(path), rel))
+                            stats.hashed += 1
+                            dirty += 1
+                        except OSError as exc:
+                            stats.errors.append(f"{rel}: hash failed ({exc})")
                 else:
                     try:
                         self._index_file(conn, path, rel, st.st_mtime, st.st_size)
@@ -413,6 +443,7 @@ class Indexer:
     def _index_file(self, conn: sqlite3.Connection, path: Path, rel: str,
                     mtime: float, size: int) -> None:
         text = extract_text(path)
+        sha = file_sha256(path)
         self._delete_path(conn, rel)
         chunks = _chunk(text)
         if chunks:
@@ -427,9 +458,9 @@ class Indexer:
                     [(rel, i, len(v), self._pack(v)) for i, v in enumerate(vectors)],
                 )
         conn.execute(
-            "INSERT OR REPLACE INTO files(path, mtime, size, n_chunks, indexed_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (rel, mtime, size, len(chunks), time.time()),
+            "INSERT OR REPLACE INTO files(path, mtime, size, n_chunks, indexed_at, sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (rel, mtime, size, len(chunks), time.time(), sha),
         )
 
     @staticmethod
@@ -448,11 +479,123 @@ class Indexer:
         except NoIndexYet:
             return
 
+    def index_paths(self, rels: Sequence[str], force: bool = False,
+                    max_file_mb: int = 50) -> IndexStats:
+        """Index (or drop) specific files right away -- no full drive walk.
+
+        Missing files are removed from the index; unchanged ones are skipped
+        unless ``force``. Used after add/import/move so new material is
+        searchable immediately.
+        """
+        started = time.time()
+        stats = IndexStats()
+        with self._db(create=True) as conn:
+            for rel in rels:
+                if rel in SKIP_ROOT_FILES:
+                    continue
+                path = self.volume / rel
+                if not path.is_file():
+                    if conn.execute("SELECT 1 FROM files WHERE path = ?", (rel,)).fetchone():
+                        self._delete_path(conn, rel)
+                        stats.removed += 1
+                    continue
+                if not is_supported(path):
+                    continue
+                stats.scanned += 1
+                st = path.stat()
+                if st.st_size > max_file_mb * 1024 * 1024:
+                    stats.skipped_unchanged += 1
+                    continue
+                prev = conn.execute("SELECT mtime, size, sha256 FROM files WHERE path = ?",
+                                    (rel,)).fetchone()
+                if (not force and prev and prev["sha256"]
+                        and abs(prev["mtime"] - st.st_mtime) < 1 and prev["size"] == st.st_size):
+                    stats.skipped_unchanged += 1
+                    continue
+                try:
+                    self._index_file(conn, path, rel, st.st_mtime, st.st_size)
+                    stats.indexed += 1
+                except ExtractionError as exc:
+                    stats.failed += 1
+                    stats.errors.append(str(exc))
+        stats.seconds = round(time.time() - started, 2)
+        return stats
+
+    def delete_paths(self, rels: Sequence[str]) -> int:
+        try:
+            with self._db(create=False) as conn:
+                for rel in rels:
+                    self._delete_path(conn, rel)
+        except NoIndexYet:
+            return 0
+        return len(rels)
+
+    def is_indexed(self, rel: str) -> bool:
+        try:
+            conn = self._open_readonly()
+        except NoIndexYet:
+            return False
+        try:
+            return conn.execute("SELECT 1 FROM files WHERE path = ?", (rel,)).fetchone() is not None
+        finally:
+            conn.close()
+
+    def paths_containing(self, text: str, limit: int = 5) -> List[str]:
+        """Indexed files whose text contains ``text`` (exact substring)."""
+        try:
+            conn = self._open_readonly()
+        except NoIndexYet:
+            return []
+        try:
+            if self._detect_fts(conn) and len(text) >= 3:
+                rows = conn.execute("SELECT DISTINCT path FROM chunks WHERE chunks MATCH ? LIMIT ?",
+                                    (self._fts_phrase(text), limit)).fetchall()
+            else:
+                cond, arg = self._like_clause("content", text)
+                rows = conn.execute(f"SELECT DISTINCT path FROM chunks WHERE {cond} LIMIT ?",
+                                    (arg, limit)).fetchall()
+            return [r["path"] for r in rows]
+        finally:
+            conn.close()
+
+    def find_by_hash(self, sha: str) -> List[str]:
+        try:
+            with self._db(create=False) as conn:
+                return [r["path"] for r in conn.execute(
+                    "SELECT path FROM files WHERE sha256 = ? ORDER BY path", (sha,))]
+        except NoIndexYet:
+            return []
+
+    def find_duplicates(self, limit: int = 50) -> dict:
+        """Groups of indexed files with identical bytes, biggest first."""
+        try:
+            with self._db(create=False) as conn:
+                groups = conn.execute(
+                    "SELECT sha256, COUNT(*) AS n, MAX(size) AS size FROM files "
+                    "WHERE sha256 IS NOT NULL GROUP BY sha256 HAVING n > 1 "
+                    "ORDER BY size DESC LIMIT ?", (limit,)).fetchall()
+                out = []
+                for g in groups:
+                    paths = [r["path"] for r in conn.execute(
+                        "SELECT path FROM files WHERE sha256 = ? ORDER BY indexed_at, path",
+                        (g["sha256"],))]
+                    out.append({"sha256": g["sha256"][:16], "size_kb": round(g["size"] / 1024, 1),
+                                "paths": paths})
+                unhashed = conn.execute(
+                    "SELECT COUNT(*) AS n FROM files WHERE sha256 IS NULL").fetchone()["n"]
+                return {"groups": out, "unhashed": unhashed}
+        except NoIndexYet:
+            return {"groups": [], "unhashed": 0}
+
     # ---- search --------------------------------------------------------- #
-    def search(self, query: str, top_k: int = 8, mode: str = "hybrid") -> List[SearchHit]:
+    def search(self, query: str, top_k: int = 8, mode: str = "hybrid",
+               folder: Optional[str] = None) -> List[SearchHit]:
         """Return the ``top_k`` most relevant chunks for ``query``.
 
         ``mode`` is one of ``"keyword"``, ``"semantic"`` or ``"hybrid"``.
+        Space-separated words must all appear (falls back to "any word" when
+        nothing matches all). File names are matched too. ``folder`` limits
+        results to one sub-folder, e.g. ``"01_Documents"``.
         """
         query = query.strip()
         if not query:
@@ -465,52 +608,119 @@ class Indexer:
         try:
             self.has_fts = self._detect_fts(conn) if conn else self.has_fts
             if mode == "keyword":
-                return self._keyword_search(conn, query, top_k)
+                return self._keyword_search(conn, query, top_k, folder)
             if mode == "semantic":
-                return (self._semantic_search(conn, query, top_k)
-                        or self._keyword_search(conn, query, top_k))
-            # hybrid: reciprocal-rank fusion of both lists.
-            kw = self._keyword_search(conn, query, top_k * 2)
-            sem = self._semantic_search(conn, query, top_k * 2)
+                return (self._semantic_search(conn, query, top_k, folder)
+                        or self._keyword_search(conn, query, top_k, folder))
+            kw = self._keyword_search(conn, query, top_k * 2, folder)
+            sem = self._semantic_search(conn, query, top_k * 2, folder)
+            if not sem:
+                return kw[:top_k]
             return self._fuse(kw, sem, top_k)
         finally:
             conn.close()
 
-    def _keyword_search(self, conn: sqlite3.Connection, query: str,
-                        top_k: int) -> List[SearchHit]:
+    @staticmethod
+    def _terms(query: str) -> List[str]:
+        out: List[str] = []
+        seen: set = set()
+        for raw in re.split(r"\s+", query.strip()):
+            term = raw.strip("\"'“”‘’，,。;；:：")
+            if term and term.lower() not in seen:
+                seen.add(term.lower())
+                out.append(term)
+        return out[:MAX_TERMS] or [query.strip()]
+
+    @staticmethod
+    def _like_clause(column: str, term: str) -> Tuple[str, str]:
+        """LIKE condition + argument; only escapes when it has to (keeps the
+        trigram index usable for the common case)."""
+        if any(ch in term for ch in "%_\\"):
+            esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            return f"{column} LIKE ? ESCAPE '\\'", f"%{esc}%"
+        return f"{column} LIKE ?", f"%{term}%"
+
+    @staticmethod
+    def _folder_clause(folder: Optional[str]) -> Tuple[str, list]:
+        folder = (folder or "").strip().strip("/")
+        if not folder or folder == ".":
+            return "", []
+        esc = folder.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return " AND path LIKE ? ESCAPE '\\'", [esc + "/%"]
+
+    @staticmethod
+    def _fts_phrase(term: str) -> str:
+        return '"' + term.replace('"', '""') + '"'
+
+    _fts_query = _fts_phrase  # backwards-compatible name
+
+    def _keyword_search(self, conn: sqlite3.Connection, query: str, top_k: int,
+                        folder: Optional[str] = None) -> List[SearchHit]:
+        terms = self._terms(query)
+        fsql, fargs = self._folder_clause(folder)
         hits: List[SearchHit] = []
-        if self.has_fts:
+        seen: set = set()
+
+        def push(path: str, cid: int, content: str, score: float, source: str) -> None:
+            if (path, cid) not in seen and len(hits) < top_k:
+                seen.add((path, cid))
+                hits.append(SearchHit(path, cid, self._snippet(content, terms), score, source))
+
+        # 1) file names (not folder names) containing every word
+        conds, args = zip(*(self._like_clause("path", t) for t in terms))
+        name_hits = 0
+        for r in conn.execute(
+                "SELECT path FROM files WHERE " + " AND ".join(conds) + fsql +
+                " ORDER BY indexed_at DESC LIMIT ?", [*args, *fargs, top_k * 5]):
+            name = r["path"].rsplit("/", 1)[-1].lower()
+            if all(t.lower() in name for t in terms) and name_hits < max(1, top_k // 2):
+                name_hits += 1
+                push(r["path"], 0, self._chunk_text(conn, r["path"], 0), 1.0, "filename")
+
+        # 2) chunks containing every word (FTS5 for words >= 3 chars)
+        long_terms = [t for t in terms if len(t) >= 3]
+        short_terms = [t for t in terms if len(t) < 3]
+        rows: list = []
+        if self.has_fts and long_terms:
+            conds = [self._like_clause("content", t) for t in short_terms]
             try:
                 rows = conn.execute(
-                    "SELECT path, cid, content, bm25(chunks) AS score "
-                    "FROM chunks WHERE chunks MATCH ? ORDER BY score LIMIT ?",
-                    (self._fts_query(query), top_k),
-                ).fetchall()
+                    "SELECT path, cid, content, bm25(chunks) AS score FROM chunks "
+                    "WHERE chunks MATCH ?" + "".join(f" AND {c}" for c, _ in conds) + fsql +
+                    " ORDER BY score LIMIT ?",
+                    [" AND ".join(self._fts_phrase(t) for t in long_terms),
+                     *(a for _, a in conds), *fargs, top_k]).fetchall()
             except sqlite3.OperationalError:
                 rows = []
             for r in rows:
-                # bm25 is lower-is-better; convert to higher-is-better in (0,1].
-                hits.append(SearchHit(r["path"], r["cid"], self._snippet(r["content"], query),
-                                      1.0 / (1.0 + max(r["score"], 0.0)), "keyword"))
-        if not hits:  # fallback / FTS disabled
-            like = f"%{query}%"
+                rel = -float(r["score"])  # bm25: more negative == better
+                push(r["path"], r["cid"], r["content"], round(rel / (1.0 + abs(rel)), 4), "keyword")
+        if not rows:
+            conds, args = zip(*(self._like_clause("content", t) for t in terms))
             rows = conn.execute(
-                "SELECT path, cid, content FROM chunks WHERE content LIKE ? LIMIT ?",
-                (like, top_k),
-            ).fetchall()
+                "SELECT path, cid, content FROM chunks WHERE " + " AND ".join(conds) + fsql +
+                " LIMIT ?", [*args, *fargs, top_k]).fetchall()
             for rank, r in enumerate(rows):
-                hits.append(SearchHit(r["path"], r["cid"], self._snippet(r["content"], query),
-                                      1.0 / (1.0 + rank), "keyword"))
+                push(r["path"], r["cid"], r["content"], round(1.0 / (1.0 + rank), 4), "keyword")
+
+        # 3) nothing matched every word: rank chunks by how many words they contain
+        if not hits and len(terms) > 1:
+            conds, args = zip(*(self._like_clause("content", t) for t in terms))
+            rows = conn.execute(
+                "SELECT path, cid, content FROM chunks WHERE (" + " OR ".join(conds) + ")" +
+                fsql + " LIMIT ?", [*args, *fargs, top_k * 10]).fetchall()
+            scored = []
+            for r in rows:
+                low = r["content"].lower()
+                n = sum(1 for t in terms if t.lower() in low)
+                scored.append((n / len(terms), r))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            for score, r in scored:
+                push(r["path"], r["cid"], r["content"], round(score, 4), "keyword-partial")
         return hits
 
-    @staticmethod
-    def _fts_query(query: str) -> str:
-        # Trigram tokenizer treats the string as a substring pattern; just
-        # neutralise the FTS5 quote character.
-        return '"' + query.replace('"', '""') + '"'
-
     def _semantic_search(self, conn: sqlite3.Connection, query: str,
-                         top_k: int) -> List[SearchHit]:
+                         top_k: int, folder: Optional[str] = None) -> List[SearchHit]:
         vectors = self._embed([query])
         if not vectors:
             return []
@@ -519,6 +729,9 @@ class Indexer:
         qv = vectors[0]
         qn = qv / (np.linalg.norm(qv) + 1e-9)
         rows = conn.execute("SELECT path, cid, dim, vec FROM embeddings").fetchall()
+        prefix = (folder or "").strip().strip("/")
+        if prefix and prefix != ".":
+            rows = [r for r in rows if r["path"].startswith(prefix + "/")]
         if not rows:
             return []
         scored: List[Tuple[float, str, int]] = []
@@ -530,7 +743,8 @@ class Indexer:
         hits: List[SearchHit] = []
         for score, path, cid in scored[:top_k]:
             content = self._chunk_text(conn, path, cid)
-            hits.append(SearchHit(path, cid, self._snippet(content, query), score, "semantic"))
+            hits.append(SearchHit(path, cid, self._snippet(content, self._terms(query)),
+                                  score, "semantic"))
         return hits
 
     @staticmethod
@@ -558,11 +772,14 @@ class Indexer:
         return out
 
     @staticmethod
-    def _snippet(content: str, query: str, width: int = 280) -> str:
+    def _snippet(content: str, terms, width: int = 280) -> str:
         if not content:
             return ""
+        if isinstance(terms, str):
+            terms = terms.split()
         lower = content.lower()
-        pos = lower.find(query.lower().split()[0]) if query.split() else -1
+        positions = [p for p in (lower.find(t.lower()) for t in terms) if p >= 0]
+        pos = min(positions) if positions else -1
         if pos < 0:
             return content[:width].strip()
         start = max(0, pos - width // 3)

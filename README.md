@@ -19,8 +19,12 @@ A portable, mount-tolerant Model Context Protocol (MCP) server for personal know
   - 外置硬盘根目录下仅保留单一 `Database/` 文件夹，整洁清爽，内含待整理收件箱 `_Inbox` 与分类归档。
 - **混合检索能力**：
   - 内置基于 SQLite FTS5 的 Trigram 中文子串分词 + BM25 排名，并可选 FastEmbed 本地向量语义召回。
+- **一步收录、即时可搜**：
+  - `kb_add_note` 把文字/数据存成规范命名的 Markdown，`kb_import_file` 从「下载」「桌面」「文稿」导入文件或整个文件夹；存完立刻能搜到，不必全盘重建索引。
+  - 按内容指纹（SHA-256）自动去重，重复收录会直接告诉你已有的那一份。
 - **AI 智能整理工作流**：
-  - 提供 `kb_scan_inbox`、`kb_move_file`、`kb_rename_file`、`kb_update_index_md` 等工具，支持 AI 全自动内容分析、规范化重命名归档并同步更新 `INDEX.md`。
+  - `kb_scan_inbox` 看收件箱 → `kb_organize` 一次调用批量命名归档；`kb_trash` 可恢复地删除；`INDEX.md` 每次改动后自动刷新。
+  - 用访达直接拖进硬盘的文件，插盘时后台自动补进索引。
 
 ---
 
@@ -79,7 +83,8 @@ A portable, mount-tolerant Model Context Protocol (MCP) server for personal know
 git clone https://github.com/admin0330/kb-mcp.git
 cd kb-mcp
 
-# 2. 一键配置环境 (自动通过 uv 安装 Python 3.11 独立虚拟环境)
+# 2. 一键配置环境 (uv 安装 Python 3.11 独立虚拟环境；有 npm 时顺带装一份固定版本的
+#    官方文件服务到 server/node，kb-files 启动更快、断网也能用)
 ./scripts/setup.sh
 
 # 3. 初始化外置硬盘目录结构 (首次使用；参数是知识库根目录，即 Database 文件夹)
@@ -101,8 +106,9 @@ cd kb-mcp
     ├── 03_Notes/              <-- 个人笔记、Markdown 卡片
     ├── 04_Archive/            <-- 历史归档文件
     ├── mcp/                   <-- 随盘携带的 MCP 系统与说明
+    ├── _Trash/                <-- kb_trash 移入的文件（按日期分组，可恢复；确认后在访达里清空）
     ├── .mcp_meta/             <-- SQLite 检索库 (index.db) 与日志 (organize.log)
-    └── INDEX.md               <-- 全库大纲索引（AI 整理后自动同步）
+    └── INDEX.md               <-- 全库大纲索引（每次改动后自动刷新）
 ```
 
 ---
@@ -111,18 +117,23 @@ cd kb-mcp
 
 | 工具名称 | 功能描述 |
 | :--- | :--- |
-| `kb_status` | 报告硬盘状态（细分到未挂载/只读/无权限/无响应等）、索引统计与后台重建进度；永不报错。 |
-| `kb_search` | 全文/关键词/语义检索，返回命中的文档段落、匹配得分与来源路径。 |
-| `kb_reindex` | 增量扫描新文件并更新索引（`full=True` 全量重构）。后台运行，超过 `wait_seconds` 先返回进度，用 `kb_status` 跟进。 |
-| `kb_scan_inbox` | 扫描 `_Inbox/` 目录下的待整理文件并生成内容预览供 AI 决策。 |
-| `kb_move_file` | 将文件从一个目录移动到另一个目录，并支持原子化重命名与索引同步。 |
-| `kb_rename_file` | 对指定文件按标准规则重命名并同步索引。 |
+| `kb_status` | 报告硬盘状态（细分到未挂载/只读/无权限/无响应等）、索引统计与后台任务进度；永不报错。 |
+| `kb_add_note` | **一步收录文字**：存成 `YYYY-MM-DD_标题.md`（带标签/出处），立即可搜，内容重复会提示。 |
+| `kb_import_file` | **从本机导入**文件或文件夹（下载/桌面/文稿/~/Claude/iCloud，及 `KB_IMPORT_DIRS`），可选 `move`，自动去重。 |
+| `kb_search` | 关键词/语义检索：空格分隔的词需同时出现（都没有时按命中词数排序），也匹配文件名；`folder=` 限定目录。 |
+| `kb_read_document` | 提取文档全文（PDF、Word、PPT、EPUB、Markdown 等），长文用 `start_char` 分页读。 |
+| `kb_scan_inbox` | 列出 `_Inbox/` 待整理文件和内容预览（`limit` 控制数量）。 |
+| `kb_organize` | **批量**移动/重命名（一次最多 200 个），索引同步、`INDEX.md` 自动刷新。 |
+| `kb_move_file` | 移动/重命名单个文件（不写扩展名时保留原扩展名）。 |
+| `kb_rename_file` | 原地重命名并同步索引。 |
+| `kb_trash` | 可恢复地删除：移到 `_Trash/<日期>/`，从检索和 `INDEX.md` 中移除。 |
+| `kb_find_duplicates` | 按内容指纹找出重复文件。 |
 | `kb_create_directory`| 在知识库内创建新的分类子目录。 |
-| `kb_read_document` | 提取指定文档的全文纯文本（支持 PDF、Word、PPT、EPUB、Markdown 等）。 |
-| `kb_list_tree` | 获取指定子目录的树状结构（支持深度限制）。 |
+| `kb_list_tree` | 目录树（深度限制，最多 600 行）。 |
+| `kb_reindex` | 全盘扫描更新索引（`full=True` 全量重建）。平时很少需要：新增/移动的文件即时索引，插盘时也会自动补扫。后台运行，进度看 `kb_status`。 |
+| `kb_health_check` | 体检：收件箱积压、`INDEX.md` 遗漏/死链、未入索引的文本文件；`fix=True` 自动修复。 |
+| `kb_update_index_md` | 立即重写 `INDEX.md`（平时会自动刷新）。 |
 | `kb_log` | 记录整理流水账到外置硬盘日志中。 |
-| `kb_update_index_md` | 重新生成并原子化覆盖根目录下的 `INDEX.md` 索引大纲。 |
-| `kb_health_check` | 检查待处理积压、死链、未收录进 `INDEX.md` 的孤立文件。 |
 
 `kb-files` 另外提供官方文件服务的全部工具（`read_text_file`、`write_file`、`list_directory`、`move_file` 等），外加它自己的 `kb_status`。
 
@@ -162,29 +173,38 @@ cd kb-mcp
 | `KB_FS_START_TIMEOUT` | `45` | 官方文件服务启动超时（秒） |
 | `KB_CACHE_DIR` | `~/.cache/kb-mcp` | kb-files 工具列表缓存位置 |
 | `KB_SQLITE_JOURNAL` | `DELETE` | 索引库日志模式（不建议改回 `WAL`） |
+| `KB_AUTO_REINDEX` | `1` | 启动和重新插盘时后台补扫索引；`0` 关闭 |
+| `KB_IMPORT_DIRS` | （空） | `kb_import_file` 额外允许读取的目录，用 `:` 分隔 |
+| `KB_FS_VERSION` | `2.0.1` | 官方文件服务的固定版本（setup.sh 与 npx 回退都用它） |
 
 测试：
 
 ```bash
 python3 -m unittest tests/test_health.py tests/test_indexer.py   # 纯标准库，任何系统
 server/.venv/bin/python tests/e2e_macos.py                       # macOS：用临时磁盘镜像模拟插拔
+server/.venv/bin/python tests/e2e_features_macos.py              # macOS：收录/导入/整理/回收站等功能
 ```
 
 ---
 
-## 💬 常用日常提示词模板
+## 💬 常用指令
 
-### 1. 【一键整理收件箱】
-> “请调用 `kb_scan_inbox` 检查外置硬盘 `_Inbox` 里的所有新文件：
-> 1. 根据内容为每个文件重命名为 `YYYY-MM-DD_[主题]_[关键词].[ext]`；
-> 2. 移动到对应分类目录（如 `01_Documents`、`02_Books` 等）；
-> 3. 调用 `kb_update_index_md` 更新根目录索引并调用 `kb_reindex` 增量更新检索库。”
+在 Claude Desktop 的输入框点 **“+” → kb-retrieval**，可以直接选这四个现成指令：
 
-### 2. 【智能检索与问答】
-> “请在知识库中检索关于‘[关键词/技术点]’的资料，总结核心结论，并注明引用自哪个文件。”
+| 指令 | 作用 |
+| :--- | :--- |
+| 一键整理收件箱 | 扫描 `_Inbox`，命名归档，一次 `kb_organize` 搞定并列表汇报 |
+| 收录到知识库 | 文字用 `kb_add_note`、本机文件用 `kb_import_file`，重复会提醒 |
+| 知识库体检 | `kb_status` + `kb_health_check(fix=True)` + `kb_find_duplicates` |
+| 检索知识库 | 多关键词检索并注明出处 |
 
-### 3. 【知识库体检】
-> “请运行 `kb_health_check` 检查知识库健康状态，并汇报积压与未索引情况。”
+也可以直接说，例如：
+
+> “把这段会议记录收进知识库，放 03_Notes，标签：会议、硬盘。”
+>
+> “把下载文件夹里的《季度报告.pdf》导入到 01_Documents。”
+>
+> “在知识库里找 2026 年硬件预算相关的资料，注明出处。”
 
 ---
 

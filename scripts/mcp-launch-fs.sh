@@ -18,7 +18,14 @@ export KB_VOLUME="${KB_VOLUME:-/Volumes/KnowledgeBase/Database}"
 # GUI apps may start servers with a minimal PATH; make Homebrew's npx findable.
 export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 
-FS_CMD=(npx -y @modelcontextprotocol/server-filesystem "$KB_VOLUME")
+# Prefer the pinned local copy installed by setup.sh (fast, works offline);
+# fall back to npx (needs the network the first time).
+LOCAL_FS="${SERVER_DIR}/node/node_modules/.bin/mcp-server-filesystem"
+if [[ -x "$LOCAL_FS" ]]; then
+  FS_CMD=("$LOCAL_FS" "$KB_VOLUME")
+else
+  FS_CMD=(npx -y "@modelcontextprotocol/server-filesystem@${KB_FS_VERSION:-2.0.1}" "$KB_VOLUME")
+fi
 
 if [[ ! -x "$PY" ]]; then
   echo "kb-files: venv python not found at $PY — run scripts/setup.sh first." >&2

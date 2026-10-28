@@ -19,6 +19,15 @@ Status-related guarantees
   after ``wait_seconds`` while indexing continues; progress shows up in
   ``kb_status``.
 
+Convenience
+-----------
+* ``kb_add_note`` / ``kb_import_file`` add material in one call; it is
+  searchable immediately (no full re-index) and exact duplicates are caught.
+* ``kb_organize`` moves many files at once; ``kb_trash`` is a recoverable
+  delete; ``INDEX.md`` refreshes itself shortly after every change.
+* When the drive (re)appears, an incremental re-index runs in the background
+  so files copied in with Finder become searchable on their own.
+
 Environment variables
 ----------------------
 KB_VOLUME            Knowledge-base root  (default /Volumes/KnowledgeBase/Database)
@@ -26,20 +35,26 @@ KB_ENABLE_SEMANTIC   "1" to enable FastEmbed semantic search (default off)
 KB_EMBED_MODEL       FastEmbed model name (default intfloat/multilingual-e5-small)
 KB_PROBE_TIMEOUT     Seconds before a drive check counts as unresponsive (default 4)
 KB_REQUIRE_EXTERNAL  "0" to allow a KB_VOLUME under /Volumes that is not a mount
+KB_AUTO_REINDEX      "0" to disable the background re-index on start / re-plug
+KB_IMPORT_DIRS       Extra folders kb_import_file may read from (":"-separated)
 """
 from __future__ import annotations
 
+import collections
 import functools
+import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import anyio
 from mcp.server.fastmcp import FastMCP
@@ -48,27 +63,52 @@ from mcp.server.fastmcp import FastMCP
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     from . import health  # noqa: E402
-    from .indexer import Indexer, IndexStats, META_DIRNAME, NoIndexYet  # noqa: E402
+    from .indexer import (Indexer, IndexStats, META_DIRNAME, NoIndexYet,  # noqa: E402
+                          TRASH_DIRNAME, file_sha256)
     from .extractors import ExtractionError, extract_text, is_supported  # noqa: E402
 except ImportError:
     import health  # type: ignore  # noqa: E402
-    from indexer import Indexer, IndexStats, META_DIRNAME, NoIndexYet  # type: ignore  # noqa: E402
+    from indexer import (Indexer, IndexStats, META_DIRNAME, NoIndexYet,  # type: ignore  # noqa: E402
+                         TRASH_DIRNAME, file_sha256)
     from extractors import ExtractionError, extract_text, is_supported  # type: ignore  # noqa: E402
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 VOLUME = Path(os.environ.get("KB_VOLUME", "/Volumes/KnowledgeBase/Database"))
 ENABLE_SEMANTIC = os.environ.get("KB_ENABLE_SEMANTIC", "0") == "1"
 EMBED_MODEL = os.environ.get("KB_EMBED_MODEL", "intfloat/multilingual-e5-small")
 PROBE_TIMEOUT = float(os.environ.get("KB_PROBE_TIMEOUT", "4"))
+AUTO_REINDEX = os.environ.get("KB_AUTO_REINDEX", "1") != "0"
 STATUS_INDEX_TIMEOUT = 6.0     # seconds kb_status waits for index statistics
 REINDEX_MAX_WAIT = 50          # keep below typical client request timeouts (60s)
+INDEX_MD_DELAY = 2.0           # debounce for automatic INDEX.md refreshes
+MAX_IMPORT_FILES = 1000
+MAX_IMPORT_BYTES = 2 * 1024 ** 3
+MAX_TREE_LINES = 600
+MAX_NAME_BYTES = 200           # APFS allows 255; leave room for "_2" suffixes
 
 CATEGORY_DIRS = ["_Inbox", "01_Documents", "02_Books", "03_Notes", "04_Archive"]
 INDEX_FILENAME = "INDEX.md"
 LOG_RELPATH = f"{META_DIRNAME}/organize.log"
+_RESERVED_TOP = {META_DIRNAME, TRASH_DIRNAME, "mcp"}
 
 _STARTED_AT = time.time()
+
+INSTRUCTIONS = """\
+Personal knowledge base on an external drive (folders: _Inbox, 01_Documents,
+02_Books, 03_Notes, 04_Archive). Paths in tools are relative to the drive root.
+- Save text the user gives you (notes, pasted data, summaries, web clips):
+  kb_add_note -- one call, searchable immediately, duplicates are caught.
+- Bring files/folders from the Mac (Downloads, Desktop, Documents, ~/Claude):
+  kb_import_file.
+- Organise: kb_scan_inbox, then ONE kb_organize call with all moves.
+  Name files YYYY-MM-DD_主题_关键词.ext. Delete = kb_trash (recoverable).
+- Find: kb_search (space-separated words must all match; folder= narrows),
+  then kb_read_document for full text (page with start_char).
+- If a tool reports drive_not_mounted / drive_unavailable, relay its "hint";
+  kb_status explains the drive state. No restart is ever needed after plugging
+  the drive in.
+"""
 
 
 def _stderr(message: str) -> None:
@@ -78,17 +118,21 @@ def _stderr(message: str) -> None:
 
 
 class _StateLogger:
-    """Writes one stderr line whenever the drive state changes."""
+    """Logs drive-state changes and starts a catch-up re-index on re-plug."""
 
     def __init__(self) -> None:
         self.last: Optional[str] = None
 
     def __call__(self, probe: dict) -> None:
         state = probe.get("state")
-        if state != self.last:
-            _stderr(f"drive state: {self.last or 'unknown'} -> {state}"
-                    + (f" ({probe.get('reason')})" if probe.get("reason") else ""))
-            self.last = state
+        if state == self.last:
+            return
+        previous, self.last = self.last, state
+        _stderr(f"drive state: {previous or 'unknown'} -> {state}"
+                + (f" ({probe.get('reason')})" if probe.get("reason") else ""))
+        if state == health.OK and previous not in (None, health.OK):
+            threading.Thread(target=_auto_reindex, args=("remount",),
+                             name="kb-auto-reindex", daemon=True).start()
 
 
 _state_logger = _StateLogger()
@@ -101,7 +145,7 @@ class _LoggingProber(health.Prober):
         return result
 
 
-mcp = FastMCP("kb-retrieval")
+mcp = FastMCP("kb-retrieval", instructions=INSTRUCTIONS)
 _prober = _LoggingProber(VOLUME, timeout=PROBE_TIMEOUT)
 _indexer = Indexer(VOLUME, enable_semantic=ENABLE_SEMANTIC, embed_model=EMBED_MODEL)
 
@@ -189,6 +233,8 @@ def _guarded(fn: Callable[..., str], write: bool, args: tuple, kwargs: dict) -> 
             return _drive_error(probe, during=fn.__name__)
         return _err("io_error", f"{type(exc).__name__}: {exc}",
                     path=getattr(exc, "filename", None))
+    except ValueError as exc:
+        return _err("bad_request", str(exc))
     except Exception as exc:  # noqa: BLE001 - a tool must answer, not crash
         _stderr(f"{fn.__name__} failed: {type(exc).__name__}: {exc}")
         return _err("internal_error", f"{type(exc).__name__}: {exc}")
@@ -210,9 +256,17 @@ def kb_tool(*, write: bool) -> Callable[[Callable[..., str]], Callable[..., Any]
     return decorate
 
 
+def _empty_means_check(fn: Callable[..., str]) -> Callable[..., str]:
+    fn._kb_empty_means_check = True  # type: ignore[attr-defined]
+    return fn
+
+
 def _safe(rel: str) -> Path:
     """Resolve ``rel`` under the volume root, refusing path-traversal escapes."""
-    rel = rel.strip().lstrip("/")
+    rel = (rel or "").strip()
+    if rel.startswith(str(VOLUME)):
+        rel = rel[len(str(VOLUME)):]  # accept absolute paths on the drive too
+    rel = rel.lstrip("/")
     target = (VOLUME / rel).resolve()
     root = VOLUME.resolve()
     if target != root and root not in target.parents:
@@ -222,6 +276,49 @@ def _safe(rel: str) -> Path:
 
 def _rel(path: Path) -> str:
     return str(path.resolve().relative_to(VOLUME.resolve()))
+
+
+def _top_dir(path: Path) -> str:
+    try:
+        parts = Path(_rel(path)).parts
+    except ValueError:
+        return ""
+    return parts[0] if parts else ""
+
+
+def _user_dir(rel: str) -> Path:
+    """A folder for user material: never the drive root's tooling folders."""
+    target = _safe(rel or "_Inbox")
+    if target == VOLUME.resolve() or _top_dir(target) in _RESERVED_TOP:
+        raise ValueError(f"not a content folder: {rel!r} (use _Inbox or a category)")
+    return target
+
+
+def _clean_name(name: str, keep_ext: str = "") -> str:
+    """A safe, tidy file name: no slashes/colons/control chars, bounded length."""
+    name = unicodedata.normalize("NFC", name or "")
+    name = re.sub(r"[\x00-\x1f\x7f/\\:]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip().strip(".").strip()
+    stem, ext = os.path.splitext(name)
+    if ext and not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", ext):
+        stem, ext = name, ""  # "v1.2 说明": the dot is part of the title
+    if keep_ext and not ext:
+        ext = keep_ext
+    while stem and len((stem + ext).encode("utf-8")) > MAX_NAME_BYTES:
+        stem = stem[:-1]
+    stem = stem.rstrip(" ._") or "untitled"
+    return stem + ext
+
+
+def _unique_target(directory: Path, name: str) -> Path:
+    target = directory / name
+    if not target.exists():
+        return target
+    stem, ext = os.path.splitext(name)
+    n = 2
+    while (directory / f"{stem}_{n}{ext}").exists():
+        n += 1
+    return directory / f"{stem}_{n}{ext}"
 
 
 def _log(message: str) -> None:
@@ -239,6 +336,119 @@ def _fmt_ts(ts: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else None
 
 
+def _index_now(rels: List[str]) -> dict:
+    """Make new/moved files searchable right away; never fails the caller."""
+    if not rels:
+        return {"indexed": 0}
+    try:
+        st = _indexer.index_paths(rels)
+        out = {"indexed": st.indexed, "failed": st.failed or None,
+               "errors": st.errors[:5] or None}
+        return {k: v for k, v in out.items() if v is not None}
+    except Exception as exc:  # noqa: BLE001 - the file operation itself succeeded
+        _stderr(f"immediate indexing failed: {exc}")
+        return {"indexed": 0, "error": f"{type(exc).__name__}: {exc}",
+                "hint": "文件已保存；稍后运行 kb_reindex 即可补上索引。"}
+
+
+# --------------------------------------------------------------------------- #
+# INDEX.md (debounced automatic refresh)
+# --------------------------------------------------------------------------- #
+def _build_index_md() -> str:
+    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        "# 📚 KnowledgeBase Index",
+        "",
+        f"> Auto-generated by kb-mcp on {today}. Do not edit by hand below this line; "
+        "it refreshes automatically after every change.",
+        "",
+    ]
+    descriptions = {
+        "_Inbox": "待整理缓冲区 (triage buffer)",
+        "01_Documents": "通用文档、报告 (documents & reports)",
+        "02_Books": "电子书、手册 (books & manuals)",
+        "03_Notes": "个人笔记、卡片 (notes & cards)",
+        "04_Archive": "历史归档 (archive)",
+    }
+    for cat in CATEGORY_DIRS:
+        cat_dir = VOLUME / cat
+        if not cat_dir.is_dir():
+            continue
+        files = sorted(p for p in cat_dir.rglob("*")
+                       if p.is_file() and not p.name.startswith("."))
+        lines.append(f"## {cat}  —  {descriptions.get(cat, '')}  ({len(files)})")
+        if not files:
+            lines.append("- _(empty)_")
+        for f in files:
+            rel = _rel(f)
+            size_kb = f.stat().st_size / 1024
+            lines.append(f"- [{f.name}](<{rel}>)  · {size_kb:.0f} KB")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_index_md() -> int:
+    content = _build_index_md()
+    index_path = VOLUME / INDEX_FILENAME
+    tmp = index_path.with_suffix(f".md.tmp{os.getpid()}")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, index_path)
+    return len(content.encode("utf-8"))
+
+
+class _IndexMdRefresher:
+    """Regenerates INDEX.md a moment after the last change (one write per burst)."""
+
+    def __init__(self, delay: float = INDEX_MD_DELAY) -> None:
+        self.delay = delay
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self.pending = False
+        self.last_written: Optional[float] = None
+        self.last_error: Optional[str] = None
+
+    def schedule(self) -> None:
+        with self._lock:
+            self.pending = True
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.delay, self._fire)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _fire(self) -> None:
+        with self._lock:
+            self._timer = None
+        self.flush()
+
+    def flush(self) -> Optional[int]:
+        """Write now if the drive is usable. Returns bytes written or None."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+        if _prober.probe()["state"] != health.OK:
+            self.last_error = "drive not writable; will refresh after the next change"
+            return None
+        try:
+            size = _write_index_md()
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            _stderr(f"INDEX.md refresh failed: {self.last_error}")
+            return None
+        self.pending, self.last_error, self.last_written = False, None, time.time()
+        _log("INDEX.md regenerated")
+        return size
+
+    def snapshot(self) -> dict:
+        snap = {"pending": self.pending, "last_written": _fmt_ts(self.last_written),
+                "last_error": self.last_error}
+        return {k: v for k, v in snap.items() if v is not None}
+
+
+_refresher = _IndexMdRefresher()
+
+
 # --------------------------------------------------------------------------- #
 # Background re-index job
 # --------------------------------------------------------------------------- #
@@ -246,12 +456,32 @@ def _reindex_payload(stats: IndexStats) -> dict:
     return {
         "scanned": stats.scanned, "indexed": stats.indexed,
         "skipped_unchanged": stats.skipped_unchanged, "removed": stats.removed,
-        "failed": stats.failed, "seconds": stats.seconds,
+        "failed": stats.failed, "hashed": stats.hashed or None, "seconds": stats.seconds,
         "errors": stats.errors[:20],
         "walk_errors": stats.walk_errors[:20] or None,
         "aborted": stats.aborted,
         "removal_skipped": stats.removal_skipped,
     }
+
+
+def _lock_reindex():
+    """Cross-process lock so two Claude windows don't index the drive at once."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        return None, True
+    try:
+        path = VOLUME / META_DIRNAME / "reindex.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+    except OSError:
+        return None, True  # can't lock (e.g. odd filesystem): just proceed
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh, True
+    except OSError:
+        fh.close()
+        return None, False
 
 
 class _ReindexJob:
@@ -261,6 +491,7 @@ class _ReindexJob:
         self._lock = threading.Lock()
         self.state = "idle"            # idle | running | done | aborted | failed
         self.full = False
+        self.trigger: Optional[str] = None
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
         self.live: Optional[IndexStats] = None
@@ -270,19 +501,23 @@ class _ReindexJob:
         self.done = threading.Event()
         self.done.set()
 
-    def start(self, full: bool) -> bool:
+    def start(self, full: bool, trigger: str = "manual") -> str:
+        """Returns "started", "running" (this process) or "busy" (another one)."""
         with self._lock:
             if self.state == "running":
-                return False
-            self.state, self.full = "running", full
+                return "running"
+            lock_fh, acquired = _lock_reindex()
+            if not acquired:
+                return "busy"
+            self.state, self.full, self.trigger = "running", full, trigger
             self.started_at, self.finished_at = time.time(), None
             self.live, self.current, self.result, self.error = None, None, None, None
             self.done = threading.Event()
-            threading.Thread(target=self._run, args=(full, self.done),
+            threading.Thread(target=self._run, args=(full, self.done, lock_fh),
                              name="kb-reindex", daemon=True).start()
-            return True
+            return "started"
 
-    def _run(self, full: bool, done: threading.Event) -> None:
+    def _run(self, full: bool, done: threading.Event, lock_fh) -> None:
         def progress(stats: IndexStats, rel: str) -> None:
             self.live, self.current = stats, rel
 
@@ -295,8 +530,10 @@ class _ReindexJob:
                                      should_abort=should_abort)
             self.live, self.result = stats, _reindex_payload(stats)
             self.state = "aborted" if stats.aborted else "done"
-            _log(f"reindex full={full}: indexed={stats.indexed} removed={stats.removed} "
-                 f"failed={stats.failed} in {stats.seconds}s"
+            if stats.indexed or stats.removed:
+                _refresher.schedule()
+            _log(f"reindex ({self.trigger}) full={full}: indexed={stats.indexed} "
+                 f"removed={stats.removed} failed={stats.failed} in {stats.seconds}s"
                  + (f" (aborted: {stats.aborted})" if stats.aborted else ""))
         except Exception as exc:  # noqa: BLE001
             probe = _prober.probe(use_cache=False)
@@ -307,6 +544,11 @@ class _ReindexJob:
             _stderr(f"reindex failed: {self.error}")
         finally:
             self.finished_at = time.time()
+            if lock_fh is not None:
+                try:
+                    lock_fh.close()
+                except OSError:
+                    pass
             done.set()
 
     def snapshot(self) -> dict:
@@ -314,6 +556,7 @@ class _ReindexJob:
         end = self.finished_at or time.time()
         snap = {
             "state": self.state,
+            "trigger": self.trigger,
             "full": self.full if self.started_at else None,
             "started_at": _fmt_ts(self.started_at),
             "finished_at": _fmt_ts(self.finished_at),
@@ -334,6 +577,16 @@ class _ReindexJob:
 
 
 _job = _ReindexJob()
+
+
+def _auto_reindex(trigger: str) -> None:
+    """Catch up with files copied in by Finder (on start-up and after re-plug)."""
+    if not AUTO_REINDEX:
+        return
+    if _prober.probe()["state"] != health.OK:
+        return
+    outcome = _job.start(False, trigger=trigger)
+    _stderr(f"auto reindex ({trigger}): {outcome}")
 
 
 # --------------------------------------------------------------------------- #
@@ -396,11 +649,13 @@ async def kb_status() -> str:
             "state_since": _fmt_ts(probe.get("state_since")),
             "last_ok_at": _fmt_ts(probe.get("last_ok_at")),
         }
-        payload["jobs"] = {"reindex": _job.snapshot()}
+        payload["jobs"] = {"reindex": _job.snapshot(), "index_md": _refresher.snapshot()}
         payload["server"] = {
             "name": "kb-retrieval", "version": __version__, "pid": os.getpid(),
             "uptime_s": round(time.time() - _STARTED_AT),
             "semantic_enabled": ENABLE_SEMANTIC,
+            "auto_reindex": AUTO_REINDEX,
+            "import_dirs": [str(p) for p in _import_roots()],
         }
         return _json(payload)
     except Exception as exc:  # noqa: BLE001 - status must never fail
@@ -411,25 +666,24 @@ async def kb_status() -> str:
         })
 
 
-def _empty_means_check(fn: Callable[..., str]) -> Callable[..., str]:
-    fn._kb_empty_means_check = True  # type: ignore[attr-defined]
-    return fn
-
-
 @kb_tool(write=False)
 @_empty_means_check
-def kb_search(query: str, top_k: int = 8, mode: str = "hybrid") -> str:
+def kb_search(query: str, top_k: int = 8, mode: str = "hybrid", folder: str = "") -> str:
     """Search the knowledge base and return the most relevant text chunks.
 
-    :param query: Natural-language question or keywords (Chinese/English).
+    Space-separated words must all appear (if nothing has all of them, chunks
+    with the most words are returned, source="keyword-partial"). File names
+    are matched too (source="filename").
+
+    :param query: Keywords or a question, e.g. "预算 硬件 2026".
     :param top_k: Number of chunks to return (1-30).
-    :param mode: "keyword" (BM25/substring), "semantic" (embeddings), or
-        "hybrid" (both, rank-fused). "hybrid" is recommended.
+    :param mode: "keyword", "semantic" (needs KB_ENABLE_SEMANTIC) or "hybrid".
+    :param folder: Optional sub-folder to search in, e.g. "02_Books".
     """
     top_k = max(1, min(int(top_k), 30))
-    hits = _get_indexer().search(query, top_k=top_k, mode=mode)
+    hits = _get_indexer().search(query, top_k=top_k, mode=mode, folder=folder or None)
     payload = {
-        "query": query, "mode": mode, "count": len(hits),
+        "query": query, "mode": mode, "folder": folder or None, "count": len(hits),
         "results": [
             {"path": h.path, "chunk": h.chunk_id, "score": round(h.score, 4),
              "source": h.source, "snippet": h.snippet}
@@ -443,11 +697,13 @@ def kb_search(query: str, top_k: int = 8, mode: str = "hybrid") -> str:
 
 @mcp.tool()
 async def kb_reindex(full: bool = False, wait_seconds: int = 40) -> str:
-    """Scan the volume and update the search index incrementally.
+    """Scan the whole drive and bring the search index up to date.
 
-    The job runs in the background. This call waits up to ``wait_seconds``
-    (0-50) and returns the result if it finished; otherwise it returns the
-    current progress and indexing continues -- poll ``kb_status`` to follow it.
+    Rarely needed: added/imported/moved files are indexed immediately, and a
+    catch-up scan runs by itself whenever the drive is plugged in. Use it after
+    copying many files onto the drive with Finder, or with ``full=True`` to
+    rebuild. Runs in the background; this call waits up to ``wait_seconds``
+    (0-50) and otherwise returns progress -- follow it with ``kb_status``.
 
     :param full: When true, re-extract every file instead of only changed ones.
     :param wait_seconds: How long to wait for completion before returning.
@@ -455,7 +711,13 @@ async def kb_reindex(full: bool = False, wait_seconds: int = 40) -> str:
     probe = await anyio.to_thread.run_sync(_prober.probe)
     if probe["state"] != health.OK:
         return _drive_error(probe)
-    if not _job.start(bool(full)):
+    outcome = await anyio.to_thread.run_sync(_job.start, bool(full))
+    if outcome == "busy":
+        return _ok({"running": True,
+                    "message": "Another kb-retrieval instance (e.g. a second Claude window) "
+                               "is indexing this drive right now; it writes to the same "
+                               "index. Try again in a little while."})
+    if outcome == "running":
         return _ok({"running": True,
                     "message": "A reindex is already running; poll kb_status for progress.",
                     "job": _job.snapshot()})
@@ -476,12 +738,35 @@ async def kb_reindex(full: bool = False, wait_seconds: int = 40) -> str:
     return _ok(result)
 
 
+_doc_cache: "collections.OrderedDict[Tuple[str, float, int], str]" = collections.OrderedDict()
+_doc_cache_lock = threading.Lock()
+
+
+def _document_text(path: Path) -> str:
+    st = path.stat()
+    key = (str(path), st.st_mtime, st.st_size)
+    with _doc_cache_lock:
+        if key in _doc_cache:
+            _doc_cache.move_to_end(key)
+            return _doc_cache[key]
+    text = extract_text(path)
+    with _doc_cache_lock:
+        _doc_cache[key] = text
+        while len(_doc_cache) > 4:
+            _doc_cache.popitem(last=False)
+    return text
+
+
 @kb_tool(write=False)
-def kb_read_document(relpath: str, max_chars: int = 6000) -> str:
+def kb_read_document(relpath: str, max_chars: int = 6000, start_char: int = 0) -> str:
     """Return the extracted plain text of one document (for quoting/summarising).
 
-    :param relpath: Path relative to the volume root, e.g. ``_Inbox/foo.pdf``.
+    Long documents are paged: when ``next_start_char`` is present, call again
+    with ``start_char`` set to it to continue reading.
+
+    :param relpath: Path relative to the volume root, e.g. ``02_Books/foo.pdf``.
     :param max_chars: Maximum characters to return (1-50000).
+    :param start_char: Offset to start from (for paging through long texts).
     """
     try:
         path = _safe(relpath)
@@ -490,12 +775,240 @@ def kb_read_document(relpath: str, max_chars: int = 6000) -> str:
     if not path.is_file():
         return _err("not_found", str(relpath))
     if not is_supported(path):
-        return _err("unsupported", path.suffix)
+        return _err("unsupported", path.suffix or "(no extension)",
+                    hint="这类文件只能存放、不能提取文字（例如图片、音视频）。")
     try:
-        text = extract_text(path, max_chars=max(1, min(int(max_chars), 50000)))
+        text = _document_text(path)
     except ExtractionError as exc:
         return _err("extract_failed", str(exc))
-    return _ok({"path": relpath, "chars": len(text), "text": text})
+    start = max(0, int(start_char))
+    end = start + max(1, min(int(max_chars), 50000))
+    chunk = text[start:end]
+    return _ok({"path": relpath, "total_chars": len(text), "start_char": start,
+                "chars": len(chunk), "next_start_char": end if end < len(text) else None,
+                "text": chunk})
+
+
+# --------------------------------------------------------------------------- #
+# Adding material
+# --------------------------------------------------------------------------- #
+def _content_sha(text: str) -> str:
+    normalised = "\n".join(line.rstrip() for line in text.strip().splitlines())
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+
+
+@kb_tool(write=True)
+def kb_add_note(title: str, content: str, category: str = "_Inbox",
+                tags: Optional[List[str]] = None, source: str = "", date: str = "",
+                allow_duplicate: bool = False) -> str:
+    """Save text in one step: notes, pasted data, a summary, a web clip, a chat excerpt.
+
+    Writes ``<category>/<YYYY-MM-DD>_<title>.md`` with a small YAML header,
+    makes it searchable immediately and refreshes INDEX.md. If a note with the
+    same content already exists, nothing is written and its path is returned
+    (``duplicate: true``) unless ``allow_duplicate`` is set.
+
+    :param title: Short title; also used for the file name.
+    :param content: The body (Markdown or plain text).
+    :param category: Target folder, e.g. "_Inbox", "03_Notes", "01_Documents/财务" (created if missing).
+    :param tags: Optional tags, e.g. ["预算", "2026"].
+    :param source: Optional origin: a URL, "微信聊天", a book title ...
+    :param date: Optional YYYY-MM-DD for the file name (default: today).
+    """
+    if not (content or "").strip():
+        return _err("empty_content", "content is empty")
+    dest_dir = _user_dir(category)
+    sha = _content_sha(content)
+    if not allow_duplicate:
+        existing = _indexer.paths_containing(f"content_sha256: {sha}")
+        if existing:
+            return _ok({"duplicate": True, "existing": existing,
+                        "message": "The same content is already in the knowledge base; "
+                                   "nothing was written."})
+    day = date.strip() if re.fullmatch(r"\d{4}-\d{2}-\d{2}", (date or "").strip()) \
+        else datetime.now().strftime("%Y-%m-%d")
+    clean_title = re.sub(r"\s+", " ", (title or "").strip()) or "未命名笔记"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    name = _clean_name(f"{day}_{clean_title}")
+    if not name.lower().endswith(".md"):
+        name += ".md"
+    target = _unique_target(dest_dir, name)
+    header = ["---", f"title: {json.dumps(clean_title, ensure_ascii=False)}", f"date: {day}"]
+    if tags:
+        header.append(f"tags: {json.dumps([str(t) for t in tags], ensure_ascii=False)}")
+    if source:
+        header.append(f"source: {json.dumps(source, ensure_ascii=False)}")
+    header += [f"added: {datetime.now().isoformat(timespec='seconds')}",
+               f"content_sha256: {sha}", "---", "", ""]
+    data = ("\n".join(header) + content.strip("\n") + "\n").encode("utf-8")
+    tmp = target.with_name(f".kbtmp-{os.getpid()}-{target.name}")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, target)
+    rel = _rel(target)
+    index = _index_now([rel])
+    _refresher.schedule()
+    _log(f"add_note {rel}")
+    return _ok({"path": rel, "bytes": len(data), "index": index})
+
+
+def _import_roots() -> List[Path]:
+    home = Path.home()
+    roots = [home / "Downloads", home / "Desktop", home / "Documents", home / "Claude",
+             home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"]
+    for extra in os.environ.get("KB_IMPORT_DIRS", "").split(os.pathsep):
+        if extra.strip():
+            roots.append(Path(os.path.expanduser(extra.strip())))
+    out = []
+    for r in roots:
+        try:
+            if r.is_dir():
+                out.append(r.resolve())
+        except OSError:
+            continue
+    return out
+
+
+def _existing_copy(src: Path, sha: str, dest_dir: Path) -> Optional[str]:
+    """Path of a file already on the drive with identical bytes, if any."""
+    found = _indexer.find_by_hash(sha)
+    if found:
+        return found[0]
+    try:  # unsupported types are not in the index: check the target folder
+        size = src.stat().st_size
+        if dest_dir.is_dir():
+            for p in dest_dir.iterdir():
+                if p.is_file() and p.stat().st_size == size and file_sha256(p) == sha:
+                    return _rel(p)
+    except OSError:
+        pass
+    return None
+
+
+@kb_tool(write=True)
+def kb_import_file(source_path: str, category: str = "_Inbox", new_name: str = "",
+                   move: bool = False, allow_duplicate: bool = False) -> str:
+    """Copy a file or a whole folder from this Mac into the knowledge base.
+
+    Allowed sources: ~/Downloads, ~/Desktop, ~/Documents, ~/Claude, iCloud
+    Drive, plus folders listed in KB_IMPORT_DIRS. Text-bearing files (PDF,
+    Word, PPT, EPUB, Markdown ...) are searchable immediately; other files
+    (images, video) are stored and listed in INDEX.md. Files whose exact
+    content is already on the drive are skipped (``skipped_duplicates``).
+
+    :param source_path: Absolute path, e.g. "~/Downloads/报告.pdf" or a folder.
+    :param category: Target folder on the drive (default "_Inbox").
+    :param new_name: Optional new name (a file's extension is kept if omitted).
+    :param move: Delete the source after a successful copy (default: keep it).
+    :param allow_duplicate: Import even if identical content already exists.
+    """
+    src = Path(os.path.expanduser((source_path or "").strip()))
+    if not src.is_absolute():
+        return _err("bad_path", "source_path must be absolute, e.g. ~/Downloads/file.pdf")
+    try:
+        src = src.resolve()
+    except OSError as exc:
+        return _err("not_found", str(exc))
+    roots = _import_roots()
+    if src == VOLUME.resolve() or VOLUME.resolve() in src.parents:
+        return _err("already_on_drive", "That path is already on the drive; use kb_move_file.")
+    if not any(src == r or r in src.parents for r in roots):
+        return _err("source_not_allowed", f"{src} is outside the folders imports may read.",
+                    allowed=[str(r) for r in roots],
+                    hint="把文件放进「下载」「桌面」或「文稿」后再导入；"
+                         "或在启动脚本里设置 KB_IMPORT_DIRS 添加目录。")
+    try:
+        exists = src.exists()
+        is_dir = src.is_dir()
+    except PermissionError:
+        exists = True
+        is_dir = False
+    if not exists:
+        return _err("not_found", str(src))
+    dest_root = _user_dir(category)
+
+    # Plan the copy (source file -> target path).
+    plan: List[Tuple[Path, Path]] = []
+    try:
+        if is_dir:
+            base = dest_root / _clean_name(new_name or src.name)
+            for dirpath, dirnames, filenames in os.walk(src):
+                dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+                rel_dir = Path(dirpath).relative_to(src)
+                for name in sorted(filenames):
+                    if name.startswith("."):
+                        continue
+                    target_dir = base.joinpath(*[_clean_name(p) for p in rel_dir.parts])
+                    plan.append((Path(dirpath) / name, target_dir / _clean_name(name)))
+                    if len(plan) > MAX_IMPORT_FILES:
+                        return _err("too_many_files",
+                                    f"more than {MAX_IMPORT_FILES} files in {src}",
+                                    hint="分几次导入子文件夹，或用访达直接拷进 _Inbox 后运行 kb_reindex。")
+        else:
+            name = _clean_name(new_name, keep_ext=src.suffix) if new_name.strip() \
+                else _clean_name(src.name)
+            plan.append((src, dest_root / name))
+        total = sum(p.stat().st_size for p, _ in plan)
+    except PermissionError as exc:
+        return _err("source_permission_denied", str(exc),
+                    hint="macOS 拒绝读取该位置：系统设置 → 隐私与安全性 → 文件与文件夹，"
+                         "允许 Claude 访问“下载”“桌面”“文稿”等文件夹。")
+    if total > MAX_IMPORT_BYTES:
+        return _err("too_large", f"{total / 1024 ** 3:.1f} GB in one import (limit "
+                                 f"{MAX_IMPORT_BYTES / 1024 ** 3:.0f} GB)",
+                    hint="大文件请用访达直接拷进硬盘的 _Inbox，再运行 kb_reindex。")
+    free = shutil.disk_usage(VOLUME).free
+    if total > free:
+        return _err("disk_full", f"needs {total / 1024 ** 2:.0f} MB, "
+                                 f"only {free / 1024 ** 2:.0f} MB free on the drive")
+
+    imported: List[str] = []
+    duplicates: List[dict] = []
+    stored_only: List[str] = []
+    done_sources: List[Path] = []
+    for source, target in plan:
+        sha = file_sha256(source)
+        if not allow_duplicate:
+            dup = _existing_copy(source, sha, target.parent)
+            if dup:
+                duplicates.append({"source": str(source), "already_at": dup})
+                done_sources.append(source)
+                continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        final = _unique_target(target.parent, target.name)
+        tmp = final.with_name(f".kbtmp-{os.getpid()}-{final.name}")
+        shutil.copy2(source, tmp)
+        os.replace(tmp, final)
+        rel = _rel(final)
+        imported.append(rel)
+        done_sources.append(source)
+        if not is_supported(final):
+            stored_only.append(rel)
+    if move:
+        for source in done_sources:
+            try:
+                source.unlink()
+            except OSError:
+                pass
+        if is_dir:
+            for dirpath, _, _ in sorted(os.walk(src), key=lambda t: -len(t[0])):
+                try:
+                    os.rmdir(dirpath)
+                except OSError:
+                    pass
+    index = _index_now([r for r in imported if r not in stored_only])
+    if imported:
+        _refresher.schedule()
+        _log(f"import {src} -> {len(imported)} file(s) in {_rel(dest_root)}")
+    return _ok({
+        "imported": imported[:200], "count": len(imported),
+        "skipped_duplicates": duplicates[:50] or None,
+        "stored_not_searchable": stored_only[:50] or None,
+        "index": index, "total_mb": round(total / 1024 ** 2, 2),
+        "source_removed": move or None,
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -503,7 +1016,7 @@ def kb_read_document(relpath: str, max_chars: int = 6000) -> str:
 # --------------------------------------------------------------------------- #
 @kb_tool(write=False)
 def kb_list_tree(subdir: str = ".", depth: int = 2) -> str:
-    """List the directory tree under ``subdir`` (depth-limited)."""
+    """List the directory tree under ``subdir`` (depth-limited, max 600 lines)."""
     try:
         base = _safe(subdir)
     except ValueError as exc:
@@ -512,12 +1025,16 @@ def kb_list_tree(subdir: str = ".", depth: int = 2) -> str:
         return _err("not_a_dir", subdir)
     depth = max(0, min(int(depth), 6))
     lines: List[str] = []
+    hidden = {"lines": 0}
 
     def walk(d: Path, level: int) -> None:
         if level > depth:
             return
         for entry in sorted(d.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
             if entry.name.startswith(".") or entry.name == META_DIRNAME:
+                continue
+            if len(lines) >= MAX_TREE_LINES:
+                hidden["lines"] += 1
                 continue
             indent = "  " * level
             if entry.is_dir():
@@ -531,24 +1048,28 @@ def kb_list_tree(subdir: str = ".", depth: int = 2) -> str:
                 lines.append(f"{indent}{entry.name} ({size})")
 
     walk(base, 0)
-    return _ok({"subdir": subdir, "tree": "\n".join(lines)})
+    return _ok({"subdir": subdir, "tree": "\n".join(lines),
+                "truncated": f"{hidden['lines']} more entries not shown; "
+                             "list a sub-folder or lower depth" if hidden["lines"] else None})
 
 
 @kb_tool(write=False)
-def kb_scan_inbox(preview_chars: int = 600) -> str:
+def kb_scan_inbox(preview_chars: int = 600, limit: int = 30) -> str:
     """List files in ``_Inbox`` with a short content preview for triage.
 
-    Use the previews to decide a target category and a new name, then call
-    :func:`kb_move_file`.
+    Decide a category and a name for each, then move them all with ONE
+    :func:`kb_organize` call. Returns at most ``limit`` items per call.
     """
     inbox = VOLUME / "_Inbox"
     if not inbox.is_dir():
         return _err("no_inbox", "_Inbox missing; run the init script.")
     preview_chars = max(100, min(int(preview_chars), 4000))
+    limit = max(1, min(int(limit), 200))
+    all_files = sorted(p for p in inbox.rglob("*")
+                       if p.is_file() and not p.name.startswith(".")
+                       and not any(part.startswith(".") for part in p.relative_to(inbox).parts))
     items = []
-    for path in sorted(inbox.rglob("*")):
-        if not path.is_file() or path.name.startswith("."):
-            continue
+    for path in all_files[:limit]:
         entry = {"path": _rel(path), "name": path.name,
                  "size_kb": round(path.stat().st_size / 1024, 1),
                  "ext": path.suffix.lower(), "supported": is_supported(path)}
@@ -558,17 +1079,15 @@ def kb_scan_inbox(preview_chars: int = 600) -> str:
             except ExtractionError as exc:
                 entry["preview"] = f"<extract failed: {exc}>"
         items.append(entry)
-    return _ok({"inbox_count": len(items), "items": items,
+    return _ok({"inbox_count": len(all_files), "items": items,
+                "more": len(all_files) - len(items) or None,
                 "categories": CATEGORY_DIRS[1:]})
 
 
 @kb_tool(write=True)
 def kb_create_directory(relpath: str) -> str:
     """Create a directory (and parents) under the volume root."""
-    try:
-        target = _safe(relpath)
-    except ValueError as exc:
-        return _err("bad_path", str(exc))
+    target = _user_dir(relpath)
     target.mkdir(parents=True, exist_ok=True)
     _log(f"mkdir {relpath}")
     return _ok({"created": _rel(target)})
@@ -583,35 +1102,86 @@ def _sync_index_rename(old_rel: str, new_rel: str) -> bool:
         return False
 
 
-@kb_tool(write=True)
-def kb_move_file(src_rel: str, dest_dir_rel: str, new_name: str = "") -> str:
-    """Move (and optionally rename) a file into a category directory.
-
-    The search index is updated in place — no reindex needed afterwards.
-
-    :param src_rel: Current path, e.g. ``_Inbox/report.pdf``.
-    :param dest_dir_rel: Target directory, e.g. ``01_Documents``.
-    :param new_name: Optional new filename; keeps the original when empty.
-    """
-    try:
-        src = _safe(src_rel)
-        dest_dir = _safe(dest_dir_rel)
-    except ValueError as exc:
-        return _err("bad_path", str(exc))
+def _move_one(src_rel: str, dest_dir_rel: str, new_name: str = "") -> dict:
+    """Move/rename one file and keep the index in step. Raises on bad input."""
+    src = _safe(src_rel)
+    dest_dir = _user_dir(dest_dir_rel)
     if not src.is_file():
-        return _err("not_found", src_rel)
+        raise FileNotFoundError(f"not found: {src_rel}")
     dest_dir.mkdir(parents=True, exist_ok=True)
-    target = dest_dir / (new_name.strip() or src.name)
-    if target.exists():
-        stem, suffix = target.stem, target.suffix
-        target = dest_dir / f"{stem}_{int(time.time())}{suffix}"
+    name = _clean_name(new_name, keep_ext=src.suffix) if (new_name or "").strip() else src.name
+    target = dest_dir / name
     old_rel = _rel(src)
+    if target.resolve() == src.resolve():
+        return {"from": old_rel, "to": old_rel, "unchanged": True}
+    target = _unique_target(dest_dir, name)
     shutil.move(str(src), str(target))
     new_rel = _rel(target)
     synced = _sync_index_rename(old_rel, new_rel)
     _log(f"move {old_rel} -> {new_rel}")
-    return _ok({"from": old_rel, "to": new_rel,
-                "index_synced": synced if not synced else None})
+    out = {"from": old_rel, "to": new_rel}
+    if not synced:
+        out["index_synced"] = False
+    if is_supported(target) and not _indexer.is_indexed(new_rel):
+        out["_index"] = new_rel
+    return out
+
+
+def _finish_moves(results: List[dict]) -> dict:
+    to_index = [r.pop("_index") for r in results if "_index" in r]
+    if any(not r.get("unchanged") for r in results if r.get("to")):
+        _refresher.schedule()
+    return _index_now(to_index) if to_index else {}
+
+
+@kb_tool(write=True)
+def kb_move_file(src_rel: str, dest_dir_rel: str, new_name: str = "") -> str:
+    """Move (and optionally rename) one file. For several files use kb_organize.
+
+    The search index is kept in sync and INDEX.md refreshes automatically.
+
+    :param src_rel: Current path, e.g. ``_Inbox/report.pdf``.
+    :param dest_dir_rel: Target directory, e.g. ``01_Documents``.
+    :param new_name: Optional new filename; the extension is kept if omitted.
+    """
+    try:
+        result = _move_one(src_rel, dest_dir_rel, new_name)
+    except FileNotFoundError as exc:
+        return _err("not_found", str(exc))
+    except ValueError as exc:
+        return _err("bad_path", str(exc))
+    index = _finish_moves([result])
+    if index:
+        result["index"] = index
+    return _ok(result)
+
+
+@kb_tool(write=True)
+def kb_organize(moves: List[Dict[str, str]]) -> str:
+    """Move/rename many files in ONE call (e.g. everything from kb_scan_inbox).
+
+    Each item: {"src": "_Inbox/a.pdf", "dest_dir": "02_Books", "new_name":
+    "2026-10-28_书名_作者.pdf"} -- new_name is optional. Items are processed
+    independently; failures are reported per item. Up to 200 items per call.
+    """
+    results: List[dict] = []
+    for item in list(moves or [])[:200]:
+        src = item.get("src") or item.get("src_rel") or ""
+        dest = item.get("dest_dir") or item.get("dest_dir_rel") or ""
+        try:
+            results.append(_move_one(src, dest, item.get("new_name", "")))
+        except (OSError, ValueError) as exc:
+            results.append({"from": src, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    index = _finish_moves(results)
+    failed = [r for r in results if r.get("ok") is False]
+    payload = {"moved": len(results) - len(failed), "failed": len(failed),
+               "results": results, "index": index or None,
+               "skipped": max(0, len(moves or []) - 200) or None}
+    if failed:
+        probe = _prober.probe(use_cache=False)
+        if probe["state"] != health.OK:
+            payload["drive"] = {"state": probe["state"], "hint": probe.get("hint")}
+    return _ok(payload)
 
 
 @kb_tool(write=True)
@@ -623,16 +1193,69 @@ def kb_rename_file(src_rel: str, new_name: str) -> str:
         return _err("bad_path", str(exc))
     if not src.is_file():
         return _err("not_found", src_rel)
-    target = src.parent / new_name.strip()
-    if target.exists():
-        return _err("exists", new_name)
+    name = _clean_name(new_name, keep_ext=src.suffix)
+    target = src.parent / name
+    if target.exists() and target.resolve() != src.resolve():
+        return _err("exists", name)
     old_rel = _rel(src)
     src.rename(target)
     new_rel = _rel(target)
     synced = _sync_index_rename(old_rel, new_rel)
+    _refresher.schedule()
     _log(f"rename {old_rel} -> {new_rel}")
     return _ok({"from": old_rel, "to": new_rel,
                 "index_synced": synced if not synced else None})
+
+
+@kb_tool(write=True)
+def kb_trash(relpath: str, reason: str = "") -> str:
+    """Remove a file or folder from the knowledge base -- recoverably.
+
+    It is moved to ``_Trash/<today>/`` (not indexed, not in INDEX.md). Restore
+    with kb_move_file; empty _Trash in Finder when you are sure.
+
+    :param relpath: e.g. "03_Notes/重复的笔记.md".
+    :param reason: Optional note for the organize log (e.g. "duplicate of ...").
+    """
+    try:
+        src = _safe(relpath)
+    except ValueError as exc:
+        return _err("bad_path", str(exc))
+    if not src.exists():
+        return _err("not_found", relpath)
+    if src == VOLUME.resolve() or _top_dir(src) in _RESERVED_TOP or \
+            (src.parent == VOLUME.resolve() and src.name in CATEGORY_DIRS):
+        return _err("protected", f"{relpath} is a top-level or system folder")
+    old_rel = _rel(src)
+    if src.is_dir():
+        gone = [p for p in _indexer.indexed_paths() if p.startswith(old_rel + "/")]
+    else:
+        gone = [old_rel]
+    day_dir = VOLUME / TRASH_DIRNAME / datetime.now().strftime("%Y-%m-%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+    target = _unique_target(day_dir, src.name)
+    shutil.move(str(src), str(target))
+    removed = _indexer.delete_paths(gone)
+    _refresher.schedule()
+    new_rel = _rel(target)
+    _log(f"trash {old_rel} -> {new_rel}" + (f" ({reason})" if reason else ""))
+    return _ok({"from": old_rel, "to": new_rel, "removed_from_index": removed,
+                "restore": {"tool": "kb_move_file", "src_rel": new_rel,
+                            "dest_dir_rel": str(Path(old_rel).parent)}})
+
+
+@kb_tool(write=False)
+def kb_find_duplicates(limit: int = 30) -> str:
+    """List groups of files with identical content (SHA-256), largest first.
+
+    Keep one of each group and remove the others with kb_trash.
+    """
+    found = _indexer.find_duplicates(limit=max(1, min(int(limit), 200)))
+    note = None
+    if found["unhashed"]:
+        note = (f"{found['unhashed']} older file(s) have no fingerprint yet; "
+                "kb_reindex adds them.")
+    return _ok({"groups": found["groups"], "count": len(found["groups"]), "note": note})
 
 
 @kb_tool(write=True)
@@ -645,65 +1268,20 @@ def kb_log(message: str) -> str:
 # --------------------------------------------------------------------------- #
 # INDEX.md maintenance & health check
 # --------------------------------------------------------------------------- #
-def _build_index_md() -> str:
-    today = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines = [
-        "# 📚 KnowledgeBase Index",
-        "",
-        f"> Auto-generated by kb-mcp on {today}. Do not edit by hand below this line; "
-        "run the 【健康检查】/【一键整理】 prompt to refresh.",
-        "",
-    ]
-    descriptions = {
-        "_Inbox": "待整理缓冲区 (triage buffer)",
-        "01_Documents": "通用文档、报告 (documents & reports)",
-        "02_Books": "电子书、手册 (books & manuals)",
-        "03_Notes": "个人笔记、卡片 (notes & cards)",
-        "04_Archive": "历史归档 (archive)",
-    }
-    for cat in CATEGORY_DIRS:
-        cat_dir = VOLUME / cat
-        if not cat_dir.is_dir():
-            continue
-        files = sorted(p for p in cat_dir.rglob("*")
-                       if p.is_file() and not p.name.startswith("."))
-        lines.append(f"## {cat}  —  {descriptions.get(cat, '')}  ({len(files)})")
-        if not files:
-            lines.append("- _(empty)_")
-        for f in files:
-            rel = _rel(f)
-            size_kb = f.stat().st_size / 1024
-            lines.append(f"- [{f.name}](<{rel}>)  · {size_kb:.0f} KB")
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
-
-
 @kb_tool(write=True)
 def kb_update_index_md() -> str:
-    """Regenerate the root ``INDEX.md`` from the current directory contents.
+    """Regenerate the root ``INDEX.md`` now (it also refreshes automatically).
 
     Writes atomically (temp file + rename) so an interrupted run never leaves a
     truncated index.
     """
-    content = _build_index_md()
-    index_path = VOLUME / INDEX_FILENAME
-    tmp = index_path.with_suffix(".md.tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, index_path)
-    _log("INDEX.md regenerated")
-    return _ok({"index": INDEX_FILENAME, "bytes": len(content.encode("utf-8"))})
+    size = _refresher.flush()
+    if size is None:
+        return _err("index_md_failed", _refresher.last_error or "unknown error")
+    return _ok({"index": INDEX_FILENAME, "bytes": size})
 
 
-@kb_tool(write=False)
-def kb_health_check() -> str:
-    """Audit the knowledge base for common problems.
-
-    Reports: files still in ``_Inbox`` (backlog), files on disk that are not
-    referenced in ``INDEX.md`` (orphans), ``INDEX.md`` links that point to
-    missing files (dead links), and files not yet in the search index.
-    """
-    import re
-
+def _health_report(max_items: int) -> dict:
     # Files physically present under the managed category dirs (excluding Inbox).
     on_disk = set()
     for cat in CATEGORY_DIRS[1:]:
@@ -713,7 +1291,6 @@ def kb_health_check() -> str:
                 if p.is_file() and not p.name.startswith("."):
                     on_disk.add(_rel(p))
 
-    # Paths referenced by INDEX.md.
     referenced = set()
     index_path = VOLUME / INDEX_FILENAME
     if index_path.is_file():
@@ -721,34 +1298,106 @@ def kb_health_check() -> str:
         for m in re.finditer(r"\]\(<?([^)>]+)>?\)", text):
             referenced.add(m.group(1).strip())
 
-    dead_links = sorted(r for r in referenced
-                        if not (VOLUME / r).is_file() and not r.startswith("http"))
-    orphans = sorted(on_disk - referenced)
-
     inbox = VOLUME / "_Inbox"
     backlog = []
     if inbox.is_dir():
         backlog = sorted(_rel(p) for p in inbox.rglob("*")
                          if p.is_file() and not p.name.startswith("."))
 
+    dead_links = sorted(r for r in referenced
+                        if not (VOLUME / r).is_file() and not r.startswith("http"))
+    orphans = sorted((on_disk | set(backlog)) - referenced)
     indexed = set(_get_indexer().indexed_paths())
-    unindexed = sorted((on_disk | set(backlog)) - indexed)
-
-    healthy = not (dead_links or orphans or backlog or unindexed)
-    payload = {
-        "healthy": healthy,
-        "inbox_backlog": backlog,
-        "orphans_not_in_index_md": orphans,
-        "dead_links_in_index_md": dead_links,
-        "files_not_in_search_index": unindexed,
+    # Only text-bearing files can be indexed; images etc. are not "missing".
+    unindexed = sorted(p for p in (on_disk | set(backlog)) - indexed
+                       if is_supported(VOLUME / p))
+    return {
+        "healthy": not (dead_links or orphans or backlog or unindexed),
+        "inbox_backlog": backlog[:max_items],
+        "orphans_not_in_index_md": orphans[:max_items],
+        "dead_links_in_index_md": dead_links[:max_items],
+        "files_not_in_search_index": unindexed[:max_items],
         "summary": {
             "backlog": len(backlog), "orphans": len(orphans),
             "dead_links": len(dead_links), "unindexed": len(unindexed),
         },
+        "_unindexed_all": unindexed,
     }
+
+
+@kb_tool(write=False)
+def kb_health_check(fix: bool = False, max_items: int = 100) -> str:
+    """Audit the knowledge base; with ``fix=True`` also repair what it can.
+
+    Reports: files still in ``_Inbox`` (backlog), files missing from
+    ``INDEX.md`` (orphans), ``INDEX.md`` links to missing files (dead links)
+    and text files not yet in the search index. ``fix=True`` indexes the
+    missing files and rewrites INDEX.md, then reports again. The inbox backlog
+    is left for you to organise.
+    """
+    max_items = max(1, min(int(max_items), 1000))
+    report = _health_report(max_items)
+    fixed = None
+    if fix:
+        if _prober.probe()["state"] != health.OK:
+            return _drive_error(_prober.probe(), during="kb_health_check(fix)")
+        todo = report["_unindexed_all"]
+        index = _index_now(todo) if todo else {"indexed": 0}
+        size = _refresher.flush() if (report["summary"]["orphans"]
+                                      or report["summary"]["dead_links"]) else None
+        fixed = {"indexed": index.get("indexed", 0), "index_md_rewritten": size is not None}
+        report = _health_report(max_items)
+    report.pop("_unindexed_all", None)
+    report["fixed"] = fixed
     if _job.state == "running":
-        payload["note"] = "A reindex is running; 'files_not_in_search_index' may shrink."
-    return _ok(payload)
+        report["note"] = "A reindex is running; 'files_not_in_search_index' may shrink."
+    return _ok(report)
+
+
+# --------------------------------------------------------------------------- #
+# Prompts (Claude Desktop: "+" menu -> kb-retrieval)
+# --------------------------------------------------------------------------- #
+@mcp.prompt(name="organize_inbox", title="一键整理收件箱",
+            description="扫描 _Inbox，命名归档，一次性移动并汇报")
+def prompt_organize_inbox() -> str:
+    return (
+        "请整理我的知识库收件箱：\n"
+        "1. 调用 kb_scan_inbox 查看 _Inbox 里的文件和内容预览；\n"
+        "2. 为每个文件定一个名字 YYYY-MM-DD_主题_关键词.扩展名（日期优先用内容里的日期，"
+        "没有就用今天），并选好分类：01_Documents 文档报告、02_Books 书和手册、"
+        "03_Notes 笔记、04_Archive 归档；拿不准的留在 _Inbox 并告诉我；\n"
+        "3. 用一次 kb_organize 把所有文件移动到位；\n"
+        "4. 如果发现内容重复，用 kb_find_duplicates 确认后用 kb_trash 移走多余的；\n"
+        "5. 最后列一张表告诉我每个文件去了哪里。")
+
+
+@mcp.prompt(name="add_to_kb", title="收录到知识库",
+            description="把文字、数据或本机文件收进知识库")
+def prompt_add_to_kb(material: str = "") -> str:
+    return (
+        "请把下面的内容收录到我的知识库：\n"
+        f"{material or '（内容见我接下来发的消息）'}\n\n"
+        "规则：文字、数据、摘录用 kb_add_note（起一个简短标题，挑合适的分类和标签，"
+        "有出处就写 source）；如果给的是我电脑上的文件或文件夹路径，用 kb_import_file。"
+        "如果工具提示重复，告诉我已有的是哪一份，不要重复保存。完成后告诉我存放路径。")
+
+
+@mcp.prompt(name="kb_checkup", title="知识库体检",
+            description="检查硬盘状态、索引、INDEX.md 和重复文件")
+def prompt_checkup() -> str:
+    return (
+        "请给我的知识库做一次体检：先 kb_status 看硬盘和索引状态；再 kb_health_check(fix=True) "
+        "修复能自动修的问题；然后 kb_find_duplicates 看有没有重复文件。"
+        "用几句话汇报结果，需要我决定的事情（比如收件箱积压、重复文件保留哪份）单独列出来。")
+
+
+@mcp.prompt(name="ask_kb", title="检索知识库",
+            description="在知识库里查资料并注明出处")
+def prompt_ask(question: str = "") -> str:
+    return (
+        f"请在我的知识库里查找：{question or '（问题见我接下来发的消息）'}\n"
+        "先用 kb_search 搜关键词（多个词用空格分开，可以换几种说法），需要细节时用 "
+        "kb_read_document 读原文。回答时注明每个结论来自哪个文件；知识库里没有就直说。")
 
 
 def main() -> None:
@@ -762,6 +1411,8 @@ def main() -> None:
                 _stderr(f"index journal_mode={mode}")
         except Exception as exc:  # noqa: BLE001 - retried on first use
             _stderr(f"index prepare skipped: {type(exc).__name__}: {exc}")
+        threading.Thread(target=_auto_reindex, args=("startup",),
+                         name="kb-auto-reindex", daemon=True).start()
     mcp.run()
 
 
